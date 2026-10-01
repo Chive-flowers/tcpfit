@@ -220,7 +220,8 @@ def agent_cmd(h, sub, args):
     elif sub == "sweep":
         if not h.peer:
             return None
-        parts += ["--peer", h.peer]
+        # fleet 本身就是无人值守批量跑: ssh 没有终端, 0.5.9 起大流量扫描默认取消, 要显式放行
+        parts += ["--peer", h.peer, "--yes"]
         if h.bandwidth:
             parts += ["--nominal", str(h.bandwidth)]
         if args.step:
@@ -228,11 +229,12 @@ def agent_cmd(h, sub, args):
     elif sub == "shape":
         rate = h.shape_rate
         if args.auto:
-            # 用目标机上 sweep 存下的推荐值
+            # 用目标机上 sweep 存下的推荐值. 没测出拐点(没有限速器/判不出/取消)时没有 RECOMMEND,
+            # 不能把空值交给 shape —— 那会报 unbound variable 再接一句误导的"没有 sweep 结果".
             return (f"[ -f /var/lib/tcpfit/sweep.result ] && "
-                    f". /var/lib/tcpfit/sweep.result && "
+                    f". /var/lib/tcpfit/sweep.result && [ -n \"${{RECOMMEND:-}}\" ] && "
                     f"{REMOTE_AGENT} shape --rate $RECOMMEND || "
-                    f"{{ echo '没有 sweep 结果, 先跑 fleet.py sweep'; exit 1; }}")
+                    f"{{ echo '没有可用的整形值: 没跑过 fleet.py sweep, 或扫描没测出拐点'; exit 1; }}")
         if not rate:
             return None
         parts += ["--rate", str(rate)]

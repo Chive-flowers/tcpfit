@@ -39,9 +39,28 @@ command -v curl >/dev/null || die "需要 curl"
 
 if [ "$MODE" = agent ]; then
   say "安装 agent 到 $PREFIX"
-  curl -fsSL "$RAW/tcpfit.sh" -o "$PREFIX/tcpfit" \
-    || die "下载失败, 检查网络或 GitHub 可达性"
-  chmod +x "$PREFIX/tcpfit"
+  # 先下到同目录临时文件, 校验通过再原子改名.
+  # curl -o 直接写最终路径的话, 传到一半断开就把【已有的可用安装截断了】——
+  # -f 只挡 HTTP 错误码, 挡不住响应体中途断流; die 之后也没有任何恢复.
+  # 实测: 截断后 tcpfit 只剩 3 行, `tcpfit version` 返回 127.
+  # tcpfit 自己的 update 用的就是临时文件 + mv, 这里要一致.
+  tmp=$(mktemp "$PREFIX/.tcpfit.XXXXXX") || die "无法在 $PREFIX 建临时文件"
+  trap 'rm -f "$tmp"' EXIT
+  curl -fsSL "$RAW/tcpfit.sh" -o "$tmp" \
+    || die "下载失败, 检查网络或 GitHub 可达性（原有安装未改动）"
+  # 内容自检: 截断的文件往往前几行是好的, 只看能不能下完不够
+  head -1 "$tmp" | grep -q '^#!' \
+    || die "下载内容不是脚本（被网关拦截?）, 原有安装未改动"
+  grep -q '^VERSION=' "$tmp" \
+    || die "下载内容不完整, 原有安装未改动"
+  bash -n "$tmp" 2>/dev/null \
+    || die "下载内容语法不完整（多半是传输被截断）, 原有安装未改动"
+  # 必须显式 755, 不能用 chmod +x —— mktemp 建的是 0600,
+  # +x 只加执行位得到 0711: 组和其他有 x 却没有 r, 而 shell 脚本
+  # 要可读才能执行, 普通用户跑 tcpfit 会直接 Permission denied.
+  chmod 755 "$tmp"
+  mv -- "$tmp" "$PREFIX/tcpfit" || die "安装失败, 原有安装未改动"
+  trap - EXIT
   rm -f /usr/local/sbin/tcpfit.sh          # 清掉 v0.3.1 及更早的安装位置
   ok "已安装: $PREFIX/tcpfit"
 
@@ -79,8 +98,15 @@ if command -v git >/dev/null 2>&1; then
 else
   say "无 git, 改用 tarball"
   mkdir -p "$PROJECT_DIR"
-  curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/main" \
-    | tar xz -C "$PROJECT_DIR" --strip-components=1 || die "下载失败"
+  # 同理: 直接 curl | tar 的话, 中途断流会把已解出的一部分文件留在目录里,
+  # 而且 `||` 只看得到管道最后一个命令(tar)的退出码, curl 的失败会被吞掉.
+  ttar=$(mktemp) || die "无法创建临时文件"
+  trap 'rm -f "$ttar"' EXIT
+  curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/main" -o "$ttar" \
+    || die "下载失败（原有目录未改动）"
+  tar tzf "$ttar" >/dev/null 2>&1 || die "压缩包不完整（传输被截断?）, 原有目录未改动"
+  tar xzf "$ttar" -C "$PROJECT_DIR" --strip-components=1 || die "解压失败"
+  rm -f "$ttar"; trap - EXIT
 fi
 
 chmod +x "$PROJECT_DIR/tcpfit.sh" "$PROJECT_DIR/orchestrator/fleet.py" 2>/dev/null || true

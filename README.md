@@ -20,6 +20,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 | 装好后 | `tcpfit` |
 | 子命令 | `tcpfit tune --role proxy --bw 500` |
 
+菜单需要终端. 远程执行用 `ssh -t <主机> tcpfit`, 脚本里用子命令.
+
 ## 菜单
 
 ```
@@ -46,7 +48,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.
 | 输入 | 行为 |
 |---|---|
 | 数字 | 按该带宽推导缓冲区, 然后实测拐点 |
-| 回车 | 现场实测带宽, 然后实测拐点 |
+| 回车 | 现场实测带宽, 然后实测拐点; 预计流量超过 50 GB 先问 |
 | `m` | 直接填限速值, 跳过拐点扫描 |
 | `0` | 不做整形 |
 
@@ -57,7 +59,7 @@ tcpfit detect                                     # 机器画像
 tcpfit probe    --peer <近处iperf3服务器>          # 探测可用带宽
 tcpfit tune     --role proxy --bw 500             # 基础调优
 tcpfit tune     --role proxy --bw 500 --save 换机房前   # 调优并给存档命名
-tcpfit sweep    --peer <近处iperf3服务器> --nominal 500
+tcpfit sweep    --peer <近处iperf3服务器> --nominal 500   # 扫拐点, 加 --yes 跳过流量确认
 tcpfit shape    --rate 510                        # 应用整形
 tcpfit shape    --off                             # 移除整形, 保留基础调优
 tcpfit harden   --swap 2G                         # 加 swap
@@ -120,7 +122,7 @@ python3 orchestrator/fleet.py verify
 | 起步 | `tcp_slow_start_after_idle=0` / `initcwnd 32` |
 | 出向整形 | HTB 全局上限 + fq 叶子 pacing |
 
-共 32 个 sysctl 参数. 缓冲区和整形值按每台机器实测推导, 不是固定值.
+基础调优设 30 个 sysctl 参数, 加 swap 时再设 `vm.swappiness`. 缓冲区和整形值按每台机器实测推导, 不是固定值.
 
 ## 拐点扫描怎么工作
 
@@ -130,7 +132,9 @@ python3 orchestrator/fleet.py verify
 |---|---|
 | 丢包低 | 没有限速器, 不整形 |
 | 丢包高 | 有限速器, 从实测吞吐往上扫找拐点 |
-| 吞吐 > 2500 Mbit | 超出扫描上限, 不扫（可用 `--cap` 调整） |
+| 吞吐 > 10000 Mbit | 超出扫描上限, 不扫（可用 `--cap` 调整） |
+
+扫描前按实测速率估流量. 超过 50 GB, 或明显超过开始前给你的预估时先问, 默认不扫.
 
 拐点在"不限速吞吐"的**上面** —— 打穿限速器会让吞吐掉下来, 所以往上找.
 
@@ -142,15 +146,15 @@ tcpfit rollback --purge-swap   # 同时删掉 harden 建的 /swapfile
 tcpfit shape --off    # 只去掉整形
 ```
 
-首次改动前自动存快照到 `/var/lib/tcpfit/pre-tune.snapshot`, 记录全部 32 项参数的原始值.
+首次改动前自动存快照到 `/var/lib/tcpfit/pre-tune.snapshot`, 记录全部 33 项参数的原始值.
 
 0.5.7 起，原始快照同时保留为 `0000 出厂状态`，不可改名或单独删除。
 `archive restore 0000` 与 `rollback` 使用同一回滚流程；“出厂状态”指首次调优前的快照。
 普通存档位于 `/var/lib/tcpfit/archives/`。基础调优后自动保存，一键调优则在最终整形、验证完成后保存。
 序号可以输入 `10` 或 `0010`；名字含空格时请加引号。
 
-恢复普通存档会同步 sysctl 启动配置和整形服务。有路由窗口设置时沿用 networkd-dispatcher hook；
-缺少该目录会提示路由只能即时恢复并返回失败。恢复失败可能已经应用部分设置，请按提示检查后重试。
+恢复普通存档会同步 sysctl 启动配置、整形服务和 initcwnd 持久化。路由只套用存档里的窗口值，不写回旧网关。
+恢复失败可能已经应用部分设置，请按提示检查后重试。
 
 `tcpfit uninstall` 默认删除存档；需要保留则加 `--keep-archives`。
 若回滚失败，卸载会停止并保留存档。卸载不删除 swap、iperf3 或 ping。
@@ -163,10 +167,33 @@ swap 默认不动 —— 删掉正在用的 swap 可能让机器立刻 OOM, 要�
 /etc/sysctl.d/99-tcpfit.conf
 /etc/systemd/system/tcpfit-qdisc.service
 /usr/local/sbin/tcpfit-qdisc.sh
-/etc/networkd-dispatcher/routable.d/50-tcpfit-initcwnd
 /etc/modules-load.d/tcpfit-bbr.conf
 /var/lib/tcpfit/
 ```
+
+initcwnd 的开机持久化按机器只用其中一种:
+
+```
+/etc/ppp/ip-up.d/50-tcpfit
+/etc/systemd/network/<网卡配置名>.network.d/50-tcpfit-initcwnd.conf
+/etc/networkd-dispatcher/routable.d/50-tcpfit-initcwnd
+/etc/systemd/system/tcpfit-initcwnd.service
+/usr/local/sbin/tcpfit-initcwnd.sh
+```
+
+### initcwnd 持久化
+
+initcwnd 设在默认路由上, 网卡重连、网络服务重启都会把它冲掉. tcpfit 按机器选一种:
+
+| 机器 | 做法 |
+|---|---|
+| PPP 拨号 | pppd 拨通后的钩子 |
+| networkd 管的 DHCP 网卡, systemd 255+（Ubuntu 24.04 / Debian 13） | 写进 networkd 配置 |
+| networkd 管的其他网卡（Ubuntu 22.04 等） | networkd-dispatcher 钩子 |
+| 其他有 systemd 的机器 | 开机执行一次的单元 |
+
+写进 networkd 配置时不重载网络, networkd 下次重启或开机后才完全生效.
+systemd 255 以下的机器, 网络服务重启后要等网卡重连或开机才补回.
 
 用了 `harden --swap` 还会创建 `/swapfile` 并往 `/etc/fstab` 加一行 —— 这两个 `rollback` 默认不动,
 要一并撤销加 `--purge-swap`. 缺 iperf3 时经你确认后会用包管理器安装它.
@@ -174,7 +201,7 @@ swap 默认不动 —— 删掉正在用的 swap 可能让机器立刻 OOM, 要�
 ## 已知限制
 
 - 瓶颈在国际链路而非端口时, 整形不会带来提升, 但输出看起来一切正常
-- 扫满区间没找到拐点时会把区间上界当成拐点, 这种情况用 `m` 手动指定
+- 扫满区间仍没找到拐点时不会整形, 结果页会说明原因; 已知限速值的话用 `m` 手动指定
 - 需要 Linux + systemd + iproute2. OpenVZ/LXC 上 `tc` 和 `initcwnd` 可能受限
 - `sweep` 需要一台近处的 iperf3 对端
 

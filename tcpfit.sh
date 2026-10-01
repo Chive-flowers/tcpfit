@@ -5,11 +5,12 @@
 # 所有"该设多少"的判断都由实测或机器规格推导, 不使用抄来的固定值.
 #
 # 用法:
-#   tcpfit.sh                               交互式菜单（不带参数即可, 推荐）
+#   tcpfit.sh                               交互式菜单（不带参数即可, 推荐; 需要终端）
 #   tcpfit.sh detect                        输出机器画像
 #   tcpfit.sh probe  --peer HOST            探测可用带宽(虚拟网卡读不到标称值时用)
 #   tcpfit.sh tune   [选项]                 应用基础调优
 #   tcpfit.sh sweep  --peer HOST [选项]     实测限速器拐点 (-4/-6 指定协议族, 默认 -4)
+#                                           预计流量很大时先问一次, 无人值守加 --yes
 #   tcpfit.sh shape  --rate N | --off       应用/移除出向整形
 #   tcpfit.sh harden --swap 2G              加 swap（小内存机防止进程被杀）
 #   tcpfit.sh verify [--peer HOST]          验证当前状态
@@ -31,7 +32,7 @@
 set -uo pipefail
 umask 022   # 固定权限: 生成的脚本和配置不能因为宽松 umask 变成他人可写
 
-VERSION="0.5.8"
+VERSION="0.5.9"
 STATE_DIR="/var/lib/tcpfit"
 SYSCTL_FILE="/etc/sysctl.d/99-tcpfit.conf"
 QDISC_SCRIPT="/usr/local/sbin/tcpfit-qdisc.sh"
@@ -41,8 +42,23 @@ ROUTE_HOOK="/etc/networkd-dispatcher/routable.d/50-tcpfit-initcwnd"
 # tcpfit-qdisc.service 是 oneshot 只在开机跑一次, networkd-dispatcher
 # 又管不到 pppd 拉起的接口 —— 这类机器必须挂 pppd 自己的钩子.
 PPP_HOOK="/etc/ppp/ip-up.d/50-tcpfit"
+# 路由窗口的第三条持久化路. 只靠 networkd-dispatcher 覆盖不住普通 Debian/Ubuntu
+# VPS —— 那个包不是默认装的（实测 hkt1: Debian 12 / systemd / ifupdown, 没有它）.
+# 后果很隐蔽: sysctl 和整形都持久, 只有路由窗口重启后丢, 而 status 显示一切正常,
+# 用户只会发现"重启后跨海速度掉了一截"却查不出原因.
+INITCWND_UNIT="/etc/systemd/system/tcpfit-initcwnd.service"
+INITCWND_SCRIPT="/usr/local/sbin/tcpfit-initcwnd.sh"
+# systemd-networkd 管的 DHCP 网卡: 窗口直接写进 networkd 自己的配置(drop-in),
+# 让它每次装默认路由都自带. 只在路由外面改的话, networkd 一重启就按自己的配置
+# 重建路由, 窗口跟着丢 —— 实测本机 9/30 openssl 安全更新后 needrestart 重启了
+# networkd, 9/27 设的 32/32 就没了, 钩子也没补回来.
+NETWORKD_DIR="/etc/systemd/network"
+INITCWND_DROPIN_NAME="50-tcpfit-initcwnd.conf"
 BBR_MODULE_FILE="/etc/modules-load.d/tcpfit-bbr.conf"
 INITCWND_MARKER="$STATE_DIR/initcwnd.owned"
+# 实际写入的窗口值. 钩子重建时要按这个来, 不能硬编码 32 ——
+# 恢复存档时窗口可能是 20/24, write_qdisc 再生成一次钩子就把它覆盖掉了.
+INITCWND_VALS="$STATE_DIR/initcwnd.vals"
 SNAPSHOT="$STATE_DIR/pre-tune.snapshot"
 FACTS="$STATE_DIR/facts"
 
@@ -58,7 +74,9 @@ _c(){ [ -t 1 ] && printf '\033[%sm%s\033[0m' "$1" "$2" || printf '%s' "$2"; }
 info(){ printf '%s %s\n' "$(_c '0;36' '[*]')" "$*"; }
 ok(){   printf '%s %s\n' "$(_c '0;32' '[+]')" "$*"; }
 warn(){ printf '%s %s\n' "$(_c '0;33' '[!]')" "$*" >&2; }
-die(){  printf '%s %s\n' "$(_c '0;31' '[x]')" "$*" >&2; exit "${2:-1}"; }
+# 第二个参数是退出码, 所以消息只能取 $1 —— 用 $* 会把退出码也打进消息里,
+# 屏幕上出现 "未做任何改动 1" 这种尾巴.
+die(){  printf '%s %s\n' "$(_c '0;31' '[x]')" "$1" >&2; exit "${2:-1}"; }
 
 # 按显示宽度对齐：CJK 占 2 列, printf 的 %-Ns 按字节算会错位.
 # 不能依赖 awk 的多字节支持 —— mawk(Debian 默认) 没有, 会把 3 字节的中文算成 3 个字符.
@@ -88,8 +106,12 @@ take_lock(){
   # 注意不能写成 exec 9>FILE 2>/dev/null —— 那个 2>/dev/null 会被 exec 当成
   # 永久重定向, 把整个脚本的 stderr 都吞掉, 所有 die/warn 就都看不见了.
   [ -w "$(dirname "$LOCK_FILE")" ] || return 0
+  # 同一次运行里可能调多次(菜单 -> 子命令). 已经拿到过就直接返回,
+  # 不要重新 exec 9> —— 那会关掉旧 fd 再开新的, 而继承了旧 fd 的
+  # 后台子进程还在持锁, 于是自己把自己挡在外面.
+  [ "${LOCK_HELD:-0}" = 1 ] && return 0
   exec 9>"$LOCK_FILE" || return 0
-  flock -n 9 && return 0
+  flock -n 9 && { LOCK_HELD=1; return 0; }
 
   # 锁被占: 可能真有另一个在跑, 也可能是上次异常退出(SSH 断线/被 kill)卡住了.
   # 给出持有者和已运行时长, 让用户能判断, 并提供一键结束 —— 光说"等它结束"
@@ -414,6 +436,15 @@ migrate_legacy(){
 # 整行左移两位. 实测客户的 HKT PPPoE 机器: detect_iface 返回 "link",
 # 于是 qdisc / 整形 / MTU / 扫描全部作用在一个不存在的网卡上, 工具整体不可用.
 # 触发条件是「默认路由没有 via」, 不限 PPPoE —— 静态点对点路由同样会中.
+# 去掉前导零. "08" 过得了整数检查, 但 bash 算术按八进制解析会报
+# "value too great for base" —— 统一成十进制再往下传.
+strip_zeros(){
+  local v="$1"
+  case "$v" in ''|*[!0-9]*) printf '%s' "$v"; return ;; esac
+  while [ "${#v}" -gt 1 ] && [ "${v#0}" != "$v" ]; do v=${v#0}; done
+  printf '%s' "$v"
+}
+
 route_field(){   # route_field <关键字> [路由行]
   local key="$1" line="${2-}"
   [ $# -ge 2 ] || line=$(ip -4 route show default 2>/dev/null | head -1)
@@ -425,6 +456,57 @@ route_field(){   # route_field <关键字> [路由行]
 # 自己拼 `via $gw dev $if` 有两个问题: 丢掉 scope/metric/proto/onlink 等
 # 服务商下发的属性; 点对点路由压根没有 via, 拼不出来 —— 早期版本因此
 # 整块跳过 initcwnd, PPPoE 机器一直拿不到.
+# 清掉【当前所有】默认路由上的窗口字段, 并读回核实.
+# 回滚不能照快照里那条路由原样 replace 回去: 网络重配之后 metric 可能变了,
+# 而 metric 是路由的键 —— replace 会【新建】一条而不是替换.
+# 实测: 快照 metric 42, 当前 metric 10 且带 32/32, rollback 返回 0,
+# 结果留下两条默认路由, 高优先级那条仍是 32/32, 另外多一条过期的 metric 42.
+# initcwnd 回滚的准确逆操作就是"把窗口字段摘掉", 不是"塞回旧路由".
+route_restore_windows(){   # route_restore_windows <网卡> [要恢复的窗口 token...]
+  # 回滚窗口要做三件事, 少一件就出问题:
+  #   1) 保留当前路由的网关 / metric / proto / src —— 照搬快照那条会新建一条
+  #      过期路由（metric 是键）, 留下两条默认路由.
+  #   2) 把【快照里原有的窗口值】写回去, 不是一律清空 —— 用户调优前可能自己
+  #      设过 initcwnd 20 initrwnd 24, 无条件摘掉等于丢了他的基线.
+  #   3) 只动目标网卡那条, 不碰无关路由.
+  local iface="$1"; shift
+  local -a want=("$@")
+  local line t skip rc=0 touched=0
+  local -a args clean
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # 只处理目标网卡那条（快照没记网卡时对所有默认路由生效）
+    if [ -n "$iface" ]; then
+      case " $line " in *" dev $iface "*) ;; *) continue ;; esac
+    fi
+    args=(); clean=(); skip=0
+    read -r -a args <<< "$line"
+    for t in "${args[@]}"; do
+      if [ "$skip" = 1 ]; then skip=0; continue; fi
+      case "$t" in initcwnd|initrwnd) skip=1 ;; *) clean+=("$t") ;; esac
+    done
+    [ "${#clean[@]}" -gt 1 ] || continue
+    touched=1
+    ip -4 route replace "${clean[@]}" "${want[@]+"${want[@]}"}" 2>/dev/null || rc=1
+  done <<< "$(ip -4 route show default 2>/dev/null)"
+  [ "$touched" = 1 ] || return 1      # 没有匹配的当前路由, 交给调用方兜底
+  # 读回核实【只能看目标那条路由】. 早期版本把所有默认路由拼在一起检查,
+  # 于是另一块网卡上用户自己设的 initcwnd 20 会让校验失败 ——
+  # 明明 test0 清对了、test1 的自定义值也正确保留, 却报"窗口未完全还原"并返回 1.
+  local now
+  now=$(ip -4 route show default 2>/dev/null)
+  if [ -n "$iface" ]; then
+    now=$(printf '%s\n' "$now" | awk -v d="$iface" '{
+      for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; next}}')
+  fi
+  if [ "${#want[@]}" = 0 ]; then
+    case "$now" in *initcwnd*|*initrwnd*) rc=1 ;; esac
+  else
+    case "$now" in *"${want[*]}"*) ;; *) rc=1 ;; esac
+  fi
+  return "$rc"
+}
+
 route_set_initcwnd(){   # route_set_initcwnd <值>
   local n="$1" route token skip=0
   local -a args=() clean=()
@@ -446,11 +528,41 @@ route_set_initcwnd(){   # route_set_initcwnd <值>
   ip -4 route replace "${clean[@]}" initcwnd "$n" initrwnd "$n" 2>/dev/null
 }
 
+# 出口网卡. 顺序很重要:
+#   1) 有明确测速目标 -> 按目标 `ip route get`. 多出口机器上主表的 default
+#      未必是目标走的路: 实测 default 出 test0, 而 198.51.100.1 经 table 100
+#      出 test1 —— 按 default 选就会在错误的网卡上测速和整形.
+#   2) 主表 default（v4, 再 v6）
+#   3) 没有 default 也能有出口: 策略路由(default 在 table 100)、
+#      双 /1 路由(0.0.0.0/1 + 128.0.0.0/1 覆盖全网, 压根没有 default).
+#      早期版本到这里就 die "找不到默认路由网卡", 这类机器整个用不了.
 detect_iface(){
-  local i
+  local i t
+  t="${TCPFIT_ROUTE_TARGET:-}"
+  if [ -n "$t" ]; then
+    i=$(route_field dev "$(ip "${IP_FAMILY:--4}" route get "$t" 2>/dev/null | head -1)")
+    [ -n "$i" ] && { echo "$i"; return; }
+  fi
   i=$(route_field dev)
   [ -n "$i" ] || i=$(route_field dev "$(ip -6 route show default 2>/dev/null | head -1)")
+  [ -n "$i" ] || i=$(route_field dev "$(ip -4 route get 1.1.1.1 2>/dev/null | head -1)")
+  [ -n "$i" ] || i=$(route_field dev \
+        "$(ip -6 route get "${TCPFIT_ROUTE_TARGET6:-2606:4700:4700::1111}" 2>/dev/null | head -1)")
   echo "$i"
+}
+
+# 把对端解析成字面地址存进 TCPFIT_ROUTE_TARGET, 供 detect_iface 按目标选出口.
+# `ip route get` 只认地址不认域名, 所以必须先解析; 解析不出就不设,
+# detect_iface 自然退回按 default 找 —— 不能因为 DNS 失败就让整个流程死掉.
+set_route_target(){   # set_route_target <对端>
+  local a
+  [ -n "${1:-}" ] || return 0
+  # `|| a=""` 不能省: 解析失败时命令替换的退出码会传给赋值语句,
+  # 调用方开了 set -e 就会在这里中止. 产品自己没开 set -e, 但不能靠这个
+  # —— 测试 harness 是开的, 而且这种隐式依赖一换环境就炸（已踩三次）.
+  a=$(resolve_ip "$1" 2>/dev/null) || a=""
+  [ -n "$a" ] && TCPFIT_ROUTE_TARGET="$a"
+  return 0
 }
 # 网关【只取 v4】. 它唯一的用途是 `ip route replace default via $gw ...`(设 initcwnd),
 # 那是 IPv4 路由表操作, 喂 v6 地址进去会直接报
@@ -472,6 +584,10 @@ clear_owned_initcwnd(){
 
   [ -f "$INITCWND_MARKER" ] && owned=1
   [ -f "$ROUTE_HOOK" ] && owned=1
+  local _d
+  for _d in "$NETWORKD_DIR"/*.network.d/"$INITCWND_DROPIN_NAME"; do
+    [ -e "$_d" ] && owned=1
+  done
   if [ "$owned" = 0 ] && [ -f "$SNAPSHOT" ]; then
     before=$(awk '/^# route: /{sub(/^# route: /, ""); print; exit}' "$SNAPSHOT")
     if [ -n "$before" ] && ! has_str "$before" ' initcwnd ' && \
@@ -484,7 +600,15 @@ clear_owned_initcwnd(){
   INITCWND_CLEARED=1
 
   # 先移除持久化入口；即使运行时路由暂时改不了，重连/重启后也不会再写回 32.
-  rm -f "$ROUTE_HOOK" "$PPP_HOOK" "$INITCWND_MARKER"
+  # 单元也要停: 留着的话下次开机它照样把窗口写回去, --no-initcwnd 等于没生效;
+  # networkd 的 drop-in 同理, 留着的话 networkd 下次装路由又带上 32.
+  remove_initcwnd_persistence || true
+  rm -f "$INITCWND_MARKER" "$INITCWND_VALS"
+  # PPP 钩子【不能】一并删: 它同时负责重拨后重建整形, 而用户这次只是要求
+  # 关掉窗口调整（--no-initcwnd / 小带宽路径）. 删了的话下次重拨整形就没了.
+  # 不用重建 —— 钩子里的窗口那段本来就由 [ -f "$INITCWND_MARKER" ] 兜着,
+  # 标记一删它自己就退化成"只恢复整形". 所以只在没有整形时才删钩子.
+  [ -x "$QDISC_SCRIPT" ] || rm -f "$PPP_HOOK"
   if ! has_str "$route" ' initcwnd ' && ! has_str "$route" ' initrwnd '; then
     return 0
   fi
@@ -673,9 +797,15 @@ calc_burst(){   # calc_burst <rate_mbit> -> bytes
 # 精度靠后面的细扫补, 粗扫没必要那么密.
 calc_step(){ awk -v b="$1" 'BEGIN{s=int(b/30/10+0.5)*10; if(s<20)s=20; printf "%d", s}'; }
 
+# 预估流量超过这个数(GB)时, 扫描前要用户再点一次头（默认否, 无终端按否）.
+# 50 大致对应 2G 带宽: 千兆机器一轮约 29 GB 不打扰, 2.5G 约 69 GB、10G 两三百 GB 必须问.
+TRAFFIC_CONFIRM_GB=50
+
 estimate_traffic_gb(){
   local st; st=$(calc_step "$1")
-  awk -v b="$1" -v st="$st" 'BEGIN{
+  # LC_ALL=C: Debian/Ubuntu 默认的 mawk 按 locale 输出小数点, de_DE / ru_RU 下会打成 "29,0",
+  # 而这个数还要当参数传给 cmd_sweep 去比较(复审在容器里实测: 向导因此在扫描前退出).
+  LC_ALL=C awk -v b="$1" -v st="$st" 'BEGIN{
     steps = int(b*0.4/st) + 1            # 粗扫档数 = (1.2b-0.8b)/步长
     mb  = b*10/8                         # probe   4 流 10 秒
     mb += b*0.4                          # 路径验证 40% 速率 8 秒
@@ -700,6 +830,7 @@ calc_buf_default(){
 # 调优会动到的全部内核参数. 快照和回滚都以这份清单为准 ——
 # 早期版本快照只记了 14 项而 tune 设了 31 项, 回滚后有 17 项在重启前仍是调优值.
 # 加参数时必须同时加到这里, 否则那个参数就回滚不掉.
+# 不再设置的参数也别删: 0.5.9 起不设 netdev_budget_usecs, 但旧版本把它改成过 4000, 回滚要靠清单还原.
 TUNED_KEYS="
   net.core.default_qdisc
   net.ipv4.tcp_congestion_control
@@ -909,6 +1040,11 @@ telemetry_ping(){
   command -v curl >/dev/null 2>&1 || return 0
   mkdir -p "$STATE_DIR" 2>/dev/null || return 0
   (
+    # 关掉继承来的锁 fd. 不关的话这个后台子进程会一直持着 flock,
+    # 于是同一次运行里紧接着的第二次 take_lock 被【自己】挡住,
+    # 报"另一个 tcpfit 正在运行 / 可能卡死" —— 而并没有第二个实例.
+    # 统计请求本身不需要锁.
+    exec 9>&- 2>/dev/null || true
     out=$(curl -fsS --max-time 3 "${STATS_URL}?v=${VERSION}" 2>/dev/null) || exit 0
     # 只接受长得像 {"today":N,"total":N} 的东西, 别把错误页写进缓存
     case "$out" in
@@ -943,8 +1079,15 @@ take_snapshot(){
     warn "  c) 确认无需回滚能力, 则: touch $SNAPSHOT"
     die "已中止, 未做任何改动" 1
   fi
-  local iface; iface=$(detect_iface)
-  {
+  local iface tmp want got; iface=$(detect_iface)
+  # 快照是 rollback 的唯一依据, 写失败绝不能继续往下改机器.
+  # 早期版本 `} > "$SNAPSHOT"` 之后直接打印 "Snapshot saved" 不做检查:
+  # 只读文件系统 / 磁盘满 / inode 耗尽 时, 屏幕说存好了, 机器照改,
+  # 而 rollback 已经没有依据了 —— 用户以为随时能退, 其实退不回去.
+  # 做法: 同目录临时文件 -> 完整性检查 -> 原子改名.
+  tmp=$(mktemp "${SNAPSHOT}.XXXXXX" 2>/dev/null) ||
+    die "无法在 $STATE_DIR 创建快照临时文件（只读文件系统? 磁盘满?）, 未做任何改动" 1
+  if ! {
     echo "# tcpfit pre-tune snapshot  $(date -u +%FT%TZ)"
     echo "KERNEL=$(uname -r)"
     for k in $TUNED_KEYS; do
@@ -952,7 +1095,16 @@ take_snapshot(){
     done
     echo "# route: $(ip route show default)"
     echo "# qdisc: $(tc qdisc show dev "$iface" 2>/dev/null | head -1)"
-  } > "$SNAPSHOT"
+  } > "$tmp"; then
+    rm -f "$tmp"; die "快照写入失败（磁盘满?）, 未做任何改动" 1
+  fi
+  # 完整性检查: TUNED_KEYS 每项都要落盘, 少一项回滚就少还原一项
+  want=$(printf '%s\n' $TUNED_KEYS | grep -c .)
+  got=$(grep -cE '^[a-z].* = ' "$tmp")
+  if [ "$got" -lt "$want" ] 2>/dev/null; then
+    rm -f "$tmp"; die "快照不完整（${got}/${want} 项）, 未做任何改动" 1
+  fi
+  mv -- "$tmp" "$SNAPSHOT" || { rm -f "$tmp"; die "快照落盘失败, 未做任何改动" 1; }
   ok "Snapshot saved: $SNAPSHOT"
   # 出厂状态同时存成 0000 存档 —— 名字固定, 后面不允许改名或删除
   mkdir -p "$ARCHIVE_DIR" 2>/dev/null
@@ -1148,12 +1300,23 @@ archive_find(){
   esac
 }
 
-# 恢复即时路由，并让 hook 只重放存档中的窗口值；网关/地址沿用启动时的路由。
+# 恢复存档里的路由窗口. 只把【窗口值】套到当前路由上, 不回放存档里的整条路由 ——
+# 存档之后网关 / metric / 网段都可能变了(换 IP、迁移、重配网络):
+#   网关变了 → 默认路由被指回旧网关, 真机上直接断网
+#   metric 变了 → metric 是路由的键, replace 会新建一条, 留下两条默认路由
+#   网段变了 → 内核拒绝, 而早期版本在那之前已经把持久化入口全删了
+# 和 cmd_rollback 同一套做法(route_restore_windows); 只有当前完全没有默认路由时
+# 才把存档那条整条装回去. 运行时改成功之后再换持久化入口.
 archive_restore_route(){
-  local route="$1" token skip=0 tmp
+  local route="$1" token skip=0 rif
   local -a args=() windows=()
-  rm -f "$ROUTE_HOOK" "$PPP_HOOK" "$INITCWND_MARKER" || return 1
-  [ -n "$route" ] || return 0
+  INITCWND_DROPIN_REMOVED=0
+  if [ -z "$route" ]; then
+    remove_initcwnd_persistence || return 1
+    rm -f "$PPP_HOOK" "$INITCWND_MARKER" "$INITCWND_VALS" || return 1
+    [ "$INITCWND_DROPIN_REMOVED" = 0 ] || networkd_pending_note
+    return 0
+  fi
   read -r -a args <<< "$route"
   for token in "${args[@]}"; do
     if [ "$skip" = 1 ]; then
@@ -1164,44 +1327,36 @@ archive_restore_route(){
     fi
   done
   [ "$skip" = 0 ] || return 1
-  ip -4 route replace "${args[@]}" 2>/dev/null || { warn "默认路由还原失败"; return 1; }
-  if [ "${#windows[@]}" -gt 0 ]; then
-    # 两条持久化路径, 有一条能用就算成功.
-    # 早期只认 networkd-dispatcher, 于是 PPPoE 机器（多半没装它）恢复
-    # 任何带 initcwnd 的存档都直接失败, 而且先把 ppp 钩子删掉了.
-    local persisted=0
-    write_ppp_hook "$(route_field dev "$route")" "${windows[@]}" && persisted=1
-    if [ ! -d "$(dirname "$ROUTE_HOOK")" ]; then
-      if [ "$persisted" = 1 ]; then
-        mkdir -p "$STATE_DIR" && : > "$INITCWND_MARKER" || return 1
-        ok "默认路由已还原，窗口持久化交给 pppd 的 ip-up 钩子"
-        return 0
-      fi
-      warn "路由已即时还原，但这台机器既无 networkd-dispatcher 也无 /etc/ppp/ip-up.d，窗口值无法持久化"
-      return 1
+  rif=$(route_field dev "$route")
+  if ! route_restore_windows "$rif" "${windows[@]+"${windows[@]}"}"; then
+    if [ -z "$(ip -4 route show default 2>/dev/null)" ]; then
+      ip -4 route replace "${args[@]}" 2>/dev/null || { warn "默认路由还原失败"; return 1; }
+    else
+      warn "默认路由窗口还原失败, 开机持久化保持不变"; return 1
     fi
-    tmp=$(mktemp "${ROUTE_HOOK}.restore.XXXXXX") || return 1
-    {
-      printf '#!/bin/bash\nwindows=('
-      printf ' %q' "${windows[@]}"
-      printf ' )\n'
-      cat <<'H'
-routes=$(ip -4 route show default)
-route=${routes%%$'\n'*}
-[ -n "$route" ] || exit 0
-read -r -a args <<< "$route"
-clean=(); skip=0
-for token in "${args[@]}"; do
-  if [ "$skip" = 1 ]; then skip=0; continue; fi
-  case "$token" in initcwnd|initrwnd) skip=1 ;; *) clean+=("$token") ;; esac
-done
-ip -4 route replace "${clean[@]}" "${windows[@]}"
-H
-    } > "$tmp" || { rm -f "$tmp"; return 1; }
-    chmod 755 "$tmp" && mv -- "$tmp" "$ROUTE_HOOK" || { rm -f "$tmp"; return 1; }
-    mkdir -p "$STATE_DIR" && : > "$INITCWND_MARKER" || return 1
   fi
-  ok "默认路由已还原，窗口持久化已同步"
+  remove_initcwnd_persistence || return 1
+  rm -f "$PPP_HOOK" "$INITCWND_MARKER" "$INITCWND_VALS" || return 1
+  if [ "${#windows[@]}" = 0 ]; then
+    ok "默认路由窗口已还原（存档里没有窗口设置）"
+    [ "$INITCWND_DROPIN_REMOVED" = 0 ] || networkd_pending_note
+    return 0
+  fi
+  # 持久化和 cmd_tune 走同一个函数. 早期这里自己挑路, 跟 tune 分歧过两次:
+  # 只认 networkd-dispatcher 时 PPPoE 机器恢复必失败; 只认前两条时普通 Debian VPS
+  # (tune 能用单元持久化的那种) 恢复存档反而报"无法持久化".
+  if persist_initcwnd "$rif" "${windows[@]}"; then
+    mkdir -p "$STATE_DIR" && : > "$INITCWND_MARKER" || return 1
+    printf '%s\n' "${windows[*]}" > "$INITCWND_VALS"
+    ok "默认路由窗口已还原为 ${windows[*]}, 开机持久化交给 ${INITCWND_VIA}"
+    case "$INITCWND_VIA" in
+      systemd-networkd*) networkd_pending_note ;;
+      *) [ "$INITCWND_DROPIN_REMOVED" = 0 ] || networkd_pending_note ;;
+    esac
+    return 0
+  fi
+  warn "路由窗口已即时还原, 但本机没有可用的持久化入口（非 PPP、没有 systemd-networkd、无法启用 systemd 单元）, 窗口值无法持久化"
+  return 1
 }
 
 archive_restore(){
@@ -1355,7 +1510,7 @@ cmd_uninstall(){
   echo "    1. 回滚到出厂状态（sysctl / initcwnd / 整形全部还原）"
   echo "    2. 删掉 $SYSCTL_FILE"
   echo "    3. 停用并删掉 tcpfit-qdisc 服务和脚本"
-  echo "    4. 删掉 $ROUTE_HOOK（开机写回 initcwnd 的 hook）"
+  echo "    4. 撤掉 initcwnd 的开机持久化（钩子 / 单元 / networkd 配置）"
   if [ "$keep_archives" = 1 ]; then
     echo "    5. 保留 $STATE_DIR（存档和快照）"
   else
@@ -1411,9 +1566,17 @@ cmd_rollback(){
   was_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   was_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
   was_rate=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
-  rm -f "$SYSCTL_FILE" "$ROUTE_HOOK" "$PPP_HOOK" "$INITCWND_MARKER" "$BBR_MODULE_FILE" || {
+  rm -f "$SYSCTL_FILE" "$ROUTE_HOOK" "$PPP_HOOK" "$INITCWND_MARKER" "$INITCWND_VALS" "$INITCWND_SCRIPT" "$BBR_MODULE_FILE" || {
     warn "调优配置未完全删除，请检查文件权限或只读文件系统"; failed=1;
   }
+  # initcwnd 的开机入口(单元 / dispatcher 钩子 / networkd drop-in)也要撤. 留着的话
+  # 下次开机或 networkd 重启时窗口又被写回去, 回滚等于没回.
+  INITCWND_DROPIN_REMOVED=0
+  remove_initcwnd_persistence || { warn "initcwnd 开机入口未完全删除"; failed=1; }
+  if [ "$INITCWND_DROPIN_REMOVED" = 1 ]; then
+    info "已删除 networkd 里的窗口配置"
+    networkd_pending_note
+  fi
   local service_stopped=1
   if ! systemctl disable --now tcpfit-qdisc.service >/dev/null 2>&1; then
     # 没装过整形服务时 disable 也会失败；已有服务停用失败则保留文件供重试。
@@ -1436,9 +1599,28 @@ cmd_rollback(){
     [ "$failed" = 0 ] && ok "已按快照还原 sysctl"
     route=$(awk '/^# route: /{sub(/^# route: /, ""); print; exit}' "$SNAPSHOT")
     if [ -n "$route" ]; then
-      local -a route_args=()
-      read -r -a route_args <<< "$route"
-      ip -4 route replace "${route_args[@]}" 2>/dev/null || { warn "默认路由还原失败"; failed=1; }
+      # 从快照那条路由里取出【网卡】和【原有窗口值】, 套到当前路由上.
+      local snap_if snap_t snap_skip=0
+      local -a snap_args=() snap_win=()
+      snap_if=$(route_field dev "$route")
+      read -r -a snap_args <<< "$route"
+      for snap_t in "${snap_args[@]}"; do
+        if [ "$snap_skip" = 1 ]; then snap_win+=("$snap_t"); snap_skip=0; continue; fi
+        case "$snap_t" in
+          initcwnd|initrwnd) snap_win+=("$snap_t"); snap_skip=1 ;;
+        esac
+      done
+      if route_restore_windows "$snap_if" "${snap_win[@]+"${snap_win[@]}"}"; then
+        [ "${#snap_win[@]}" = 0 ] || info "已还原调优前的窗口值: ${snap_win[*]}"
+      elif [ -z "$(ip -4 route show default 2>/dev/null)" ]; then
+        # 压根没有默认路由了, 这时才把快照那条整体塞回去
+        local -a route_args=()
+        read -r -a route_args <<< "$route"
+        ip -4 route replace "${route_args[@]}" 2>/dev/null ||
+          { warn "默认路由还原失败"; failed=1; }
+      else
+        warn "默认路由窗口未完全还原"; failed=1
+      fi
     fi
   else
     warn "找不到快照, 仅移除了调优文件；重启后内核默认值生效"
@@ -1504,6 +1686,10 @@ cmd_tune(){
   done
   case "$role" in proxy|bulk|mixed) ;; *) die "role 只能是 proxy / bulk / mixed" ;; esac
 
+  # 目标必须在 detect_iface 【之前】设好. 早期版本先缓存了 iface、
+  # 后面才 set_route_target, 于是多出口机器上 iface 仍是主表 default 的那块,
+  # 后续 probe_bandwidth / 整形全都作用在错网卡上.
+  set_route_target "$peer"
   local iface ram; iface=$(detect_iface); ram=$(detect_ram_mb)
   [ -n "$iface" ] || die "找不到默认路由网卡"
   # --rtt 给了就用给的, 没给就用固定值. 不再探测, 所以不会再出现
@@ -1550,7 +1736,16 @@ cmd_tune(){
   has_word "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)" bbr || {
     warn "kernel has no BBR, falling back to cubic (much smaller gain)"; cc=cubic; }
 
-  cat > "$SYSCTL_FILE" <<EOF
+  # 写不出去就必须停下: 只改了运行时值、开机配置没落盘, 那不是"基础调优成功" ——
+  # 重启全丢, 而屏幕报的是 applied.
+  # 「能创建」和「非空」都不足以证明写完整: ulimit -f 限制下 cat 会报
+  # File too large 但已经留下 1024 字节的截断内容, 两个检查都能通过.
+  # 所以: 同目录临时文件 -> 检查 cat 的退出状态 -> 结尾哨兵行 -> 原子改名.
+  # 失败时原配置保持不动.
+  local _sc_tmp
+  _sc_tmp=$(mktemp "${SYSCTL_FILE}.XXXXXX" 2>/dev/null) ||
+    die "无法在 $(dirname "$SYSCTL_FILE") 创建临时文件（只读文件系统? 磁盘满?）, 未做任何改动" 1
+  if ! cat > "$_sc_tmp" <<EOF
 # 由 tcpfit v$VERSION 生成  $(date -u +%FT%TZ)
 # 带宽=${bw}Mbps  RTT=${rtt}ms  内存=${ram}MB  角色=${role}
 # 勿手改；要改用 tcpfit tune 重新生成
@@ -1573,7 +1768,7 @@ net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_adv_win_scale = 1
 
 net.core.netdev_max_backlog = 16384
-# netdev_budget / budget_usecs 都测过了, 【没有可测量的差别】, 所以维持原值.
+# netdev_budget 测过了, 【没有可测量的差别】, 所以维持原值.
 # 唯一可信的那组是自有对端(4 台并发 3.75G, n=5, 变异系数 0%):
 #   budget 600(现值) 3751 Mbps   budget 300(内核默认) 3745 Mbps   差 0.16%
 #   两边 softnet_drop 都是 0, time_squeeze 相当.
@@ -1582,7 +1777,9 @@ net.core.netdev_max_backlog = 16384
 #   同一个变体既能跑 9395 也能跌到 2817, 噪声完全压过参数效应.
 #   曾经据此误判成"600 有害", 复核后推翻. 要重测请用自有对端.
 net.core.netdev_budget = 600
-net.core.netdev_budget_usecs = 4000
+# netdev_budget_usecs 不设, 用内核默认: 2 个时钟 tick (HZ=1000 是 2000, HZ=250 是 8000).
+#   以前写死 4000, 在 HZ=250 的内核(Debian 全系等)上等于把默认值砍半;
+#   6.1.130+/6.6.84+/6.12.20+/6.14+ 不允许低于 2 个 tick, 直接拒绝 (issue #9).
 net.core.optmem_max = 65536
 net.core.somaxconn = 8192
 net.ipv4.tcp_max_syn_backlog = 8192
@@ -1607,7 +1804,21 @@ fs.file-max = 1000000
 # 刻意不设的项:
 #   tcp_notsent_lowat  —— 低核数机器上压吞吐
 #   tcp_reordering=300 —— 现代内核走 RACK, 调高只推迟快速重传
+# tcpfit-end
 EOF
+  then
+    rm -f "$_sc_tmp"
+    die "写入 $SYSCTL_FILE 失败（磁盘满? 配额/文件大小限制?）, 原配置未改动" 1
+  fi
+  # 哨兵行: cat 即使被信号打断也可能返回 0, 用结尾标记确认内容完整
+  if ! tail -1 "$_sc_tmp" | grep -qx '# tcpfit-end'; then
+    rm -f "$_sc_tmp"
+    die "开机配置写入不完整（被截断）, 原配置未改动" 1
+  fi
+  # mktemp 建出来是 0600, 直接改名过去 sysctl.d 里就只有它是 600 ——
+  # 和 install.sh 的 0711 是同一个坑. 存档恢复那条路径本来就有 chmod 644.
+  chmod 644 "$_sc_tmp" && mv -- "$_sc_tmp" "$SYSCTL_FILE" || {
+    rm -f "$_sc_tmp"; die "开机配置落盘失败, 原配置未改动" 1; }
 
   # 逐项校验并把内核拒绝的项注释掉.
   #
@@ -1633,6 +1844,9 @@ EOF
       _bad=$(( _bad + 1 ))
     fi
   done < "$SYSCTL_FILE"
+  # 读回确认: 哨兵行必须还在（上面的 sed 注释操作也可能写坏文件）
+  tail -1 "$SYSCTL_FILE" 2>/dev/null | grep -qx '# tcpfit-end' ||
+    die "开机配置 $SYSCTL_FILE 不完整, 基础调优未完成" 1
 
   if [ "$_bad" -gt 0 ]; then
     ok "sysctl applied: $SYSCTL_FILE（$_bad 项被本内核拒绝, 已注释, 不影响其他调优）"
@@ -1641,28 +1855,37 @@ EOF
   fi
 
   if [ "$no_initcwnd" = 0 ]; then
+    local _rt_ok=0
     if route_set_initcwnd 32; then
+      _rt_ok=1
       mkdir -p "$STATE_DIR"; : > "$INITCWND_MARKER"
+      printf 'initcwnd 32 initrwnd 32\n' > "$INITCWND_VALS"
       ok "initcwnd/initrwnd = 32"
     else
-      warn "initcwnd not applied (unsupported on some hypervisors)"
+      if [ -z "$(ip -4 route show default 2>/dev/null)" ]; then
+        warn "initcwnd 未设置: 主表里没有默认路由（策略路由 / 双 /1 路由）"
+      else
+        warn "initcwnd not applied (unsupported on some hypervisors)"
+      fi
     fi
-    write_ppp_hook "$iface" || true
-    if [ -d /etc/networkd-dispatcher/routable.d ]; then
-      cat > "$ROUTE_HOOK" <<'H'
-#!/bin/bash
-# 沿用现有路由的全部 token, 只换窗口字段 —— 见主脚本 route_set_initcwnd 的注释.
-R=$(ip -4 route show default 2>/dev/null | head -1)
-[ -n "$R" ] || exit 0
-read -r -a A <<< "$R"; C=(); S=0
-for t in "${A[@]}"; do
-  if [ "$S" = 1 ]; then S=0; continue; fi
-  case "$t" in initcwnd|initrwnd) S=1 ;; *) C+=("$t") ;; esac
-done
-[ "${#C[@]}" -gt 1 ] && ip -4 route replace "${C[@]}" initcwnd 32 initrwnd 32
-exit 0
-H
-      chmod +x "$ROUTE_HOOK"
+    # 持久化路按可靠性挑一条, 至少要落一条; 全落不上必须明说 ——
+    # 早期版本两条都不命中时一声不响, 用户以为设好了, 重启就丢.
+    # 而 sysctl 和整形是持久的, 只有路由窗口这一项会丢 —— 差别用户看不出来.
+    # 网卡按 route_set_initcwnd 实际改的那条路由取(主表第一条 default),
+    # 不按测速目标取 —— 多出口机器上两者可能不同, 持久化要补的是改过的那条.
+    local _wif; _wif=$(route_field dev); [ -n "$_wif" ] || _wif="$iface"
+    if persist_initcwnd "$_wif"; then
+      info "initcwnd 开机持久化: ${INITCWND_VIA}"
+      case "$INITCWND_VIA" in systemd-networkd*)
+        # 运行时没设上(上面已经报了)就不能说"已带上"
+        if [ "$_rt_ok" = 1 ]; then echo "  现在的路由已带上窗口."
+        else echo "  当前路由没能设上窗口(见上面的提示), networkd 下次装路由时会自带."; fi
+        networkd_pending_note ;;
+      esac
+    else
+      warn "initcwnd 只在本次生效, 重启后会丢 —— 本机没有可用的持久化入口."
+      echo "  已尝试: pppd 钩子、systemd-networkd、systemd 单元, 这台都用不了."
+      echo "  注意: sysctl（BBR / 缓冲区）和整形是持久的, 只有路由窗口这一项会丢."
     fi
   elif clear_owned_initcwnd; then
     [ "${INITCWND_CLEARED:-0}" = 1 ] && ok "Low-bandwidth path: tcpfit initcwnd override removed"
@@ -1856,17 +2079,87 @@ qdisc_set_fq(){   # qdisc_set_fq <iface>
 # 【整形和 initcwnd 都要靠它】—— 所以 cmd_tune 设了 initcwnd 也要装,
 # 不能只在应用整形时装: 线路没有限速器时不整形, 但 initcwnd 照样需要恢复.
 # 钩子本身两个守卫都会自检, 对应产物不在时是空操作.
+# 判断一块网卡是不是真的 PPP 设备. ARPHRD_PPP = 512（内核常量,
+# include/uapi/linux/if_arp.h）, 比按 "ppp*" 猜名字可靠 ——
+# OpenWrt 叫 pppoe-wan, 而别的东西也可能叫 pppx.
+iface_is_ppp(){ [ "$(cat "/sys/class/net/$1/type" 2>/dev/null)" = 512 ]; }
+
+# 开机把路由窗口写回去. 给"有 systemd 但网不归 systemd-networkd 管"的机器用
+# (ifupdown / NetworkManager). 用单元的代价: 它只在开机跑一次, 中途换 IP/重连
+# 不会跟上 —— 所以排在 PPP 钩子和 networkd 两条路之后, 只是兜底(见 persist_initcwnd).
+write_initcwnd_unit(){   # write_initcwnd_unit <网卡名> [窗口 token...]
+  local iface="$1"; shift
+  local -a win=("$@")
+  if [ "${#win[@]}" = 0 ] && [ -s "$INITCWND_VALS" ]; then
+    read -r -a win < "$INITCWND_VALS"
+  fi
+  [ "${#win[@]}" -gt 0 ] || win=(initcwnd 32 initrwnd 32)
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ -d "$(dirname "$INITCWND_UNIT")" ] || return 1
+  mkdir -p "$(dirname "$INITCWND_SCRIPT")" 2>/dev/null || return 1
+  {
+    printf '#!/bin/sh\n'
+    printf '# tcpfit: 开机写回路由窗口. 沿用现有路由的全部 token, 只换窗口字段 ——\n'
+    printf '# 自己拼 `via X dev Y` 会丢掉 onlink / metric / proto / src.
+# 实例: 一台香港机器的路由是 `default via 192.168.146.1 dev eth0 onlink`
+# —— 服务商 cloud-init 下发的, 拼不出来.\n'
+    printf 'R=$(ip -4 route show default 2>/dev/null |\n'
+    printf '    awk -v d=%s \x27{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; exit}}\x27)\n' \
+           "$(printf '%q' "$iface")"
+    printf '[ -n "$R" ] || exit 0\n'
+    cat <<'IH'
+C=$(printf '%s' "$R" | awk '{o="";for(i=1;i<=NF;i++){if($i=="initcwnd"||$i=="initrwnd"){i++;continue};o=o" "$i};print o}')
+IH
+    printf '[ -n "$C" ] && ip -4 route replace $C%s 2>/dev/null\n' "$(printf ' %s' "${win[@]}")"
+    printf 'exit 0\n'
+  } > "$INITCWND_SCRIPT" || return 1
+  chmod 755 "$INITCWND_SCRIPT" || return 1
+  cat > "$INITCWND_UNIT" <<EOF || return 1
+[Unit]
+Description=tcpfit initcwnd/initrwnd on the default route
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$INITCWND_SCRIPT
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  # 写出来不等于会开机跑 —— 必须 enable 成功才算持久化.
+  # 但要把"写不出去"和"写了 systemd 不收"分开说: 后者文件还在, 用户可以手动
+  # systemctl enable; 笼统说"没有可用的持久化入口"会让人以为白干了.
+  if systemctl enable --now tcpfit-initcwnd.service >/dev/null 2>&1 &&
+     systemctl is-enabled tcpfit-initcwnd.service >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "已生成 $INITCWND_UNIT, 但 systemd 没接受它."
+  echo "  手动启用:  systemctl enable --now tcpfit-initcwnd.service"
+  return 1
+}
+
 write_ppp_hook(){   # write_ppp_hook <网卡名> [窗口 token...]
   # 网卡名显式传进来, 不靠 bash 动态作用域去蹭调用方的 local iface ——
   # 那种隐式依赖一改调用方就静默失效.
   # 窗口值也要能指定: 恢复存档时用的是存档里的值, 不一定是 32.
   local iface="$1"; shift
-  local -a win=("$@"); [ "${#win[@]}" -gt 0 ] || win=(initcwnd 32 initrwnd 32)
+  local -a win=("$@")
+  # 没显式给窗口值时, 优先读上次实际写入的那份, 再退回 32/32.
+  if [ "${#win[@]}" = 0 ] && [ -s "$INITCWND_VALS" ]; then
+    read -r -a win < "$INITCWND_VALS"
+  fi
+  [ "${#win[@]}" -gt 0 ] || win=(initcwnd 32 initrwnd 32)
   [ -n "$iface" ] || return 1
-  # 目录不存在 = 这台不是 pppd 机器. 返回 1 让调用方知道这条持久化路径不可用,
+  # 两个条件缺一不可, 返回 1 让调用方知道这条持久化路径不可用,
   # 好去试别的（networkd-dispatcher）, 而不是当成已经持久化了.
-  # 取 dirname 而不是写死路径 —— 和 ROUTE_HOOK 的处理保持一致, 测试才能重定向.
+  #   1) 目录存在（取 dirname 不写死路径, 和 ROUTE_HOOK 一致, 测试才能重定向）
+  #   2) 【这块网卡确实是 PPP 设备】—— 只看目录不够: 装了 ppp 包(比如为了
+  #      跑 PPTP/L2TP 客户端)的普通机器也有这个目录, 但它的 eth0 永远不会
+  #      触发 pppd 的 ip-up 事件. 早期版本只查目录, 于是在这种机器上
+  #      回报"窗口已持久化交给 pppd", 实际重启就没了.
   [ -d "$(dirname "$PPP_HOOK")" ] || return 1
+  iface_is_ppp "$iface" || return 1
   {
     printf '#!/bin/sh\n'
     printf '# tcpfit: pppd 每次拨通后执行, $1 = 接口名.\n'
@@ -1878,16 +2171,159 @@ write_ppp_hook(){   # write_ppp_hook <网卡名> [窗口 token...]
            "$(printf '%q' "$QDISC_SCRIPT")" "$(printf '%q' "$QDISC_SCRIPT")"
     printf '# initcwnd: 沿用新路由的全部 token, 只补窗口字段（只在 tcpfit 设过时才做）\n'
     printf 'if [ -f %s ]; then\n' "$(printf '%q' "$INITCWND_MARKER")"
+    printf '# 必须按 $1 筛选默认路由, 不能取第一条 —— 多出口机器上第一条\n'
+    printf '# 可能是别的网卡(metric 更低), 那样会给 eth1 加窗口, ppp0 反而没加.\n'
     cat <<'H'
-  R=$(ip -4 route show default 2>/dev/null | head -1)
-  D=$(printf '%s' "$R" | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
-  if [ -n "$R" ] && [ -n "$D" ]; then
+  R=$(ip -4 route show default 2>/dev/null |
+      awk -v d="$1" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; exit}}')
+  if [ -n "$R" ]; then
     C=$(printf '%s' "$R" | awk '{o="";for(i=1;i<=NF;i++){if($i=="initcwnd"||$i=="initrwnd"){i++;continue};o=o" "$i};print o}')
 H
     printf '    [ -n "$C" ] && ip -4 route replace $C%s 2>/dev/null\n' "$(printf ' %s' "${win[@]}")"
     printf '  fi\nfi\nexit 0\n'
   } > "$PPP_HOOK" || return 1
   chmod 755 "$PPP_HOOK"
+}
+
+# systemd-networkd 是否真的在管这块网卡. 只看 /etc/networkd-dispatcher 在不在不够:
+# Ubuntu 默认装着 networkd-dispatcher, 网却可能是 ifupdown / NetworkManager 管的 ——
+# 那样钩子永远不会被触发, 而早期版本据此报"已持久化", 单元兜底也被跳过.
+networkd_manages(){   # networkd_manages <网卡>
+  [ -n "${1:-}" ] || return 1
+  command -v networkctl >/dev/null 2>&1 || return 1
+  systemctl is-active -q systemd-networkd 2>/dev/null || return 1
+  # configuring 也算: networkd 正在(重新)配置这块网卡, 同样是它在管.
+  # 只认 configured 时容器实测偶发落空 —— 赶上 networkd 刚好在重配, 就退到了只在开机跑的单元.
+  # 不能写成 `networkctl status | grep -q`: grep 一匹配就退出关管道, 真机上 status 输出很长
+  # (末尾还带日志), networkctl 往关掉的管道里写被 SIGPIPE 杀掉(141), pipefail 下整条判失败.
+  # 容器里输出短测不出来, 本机实跑才暴露 —— 先存变量再查.
+  local st
+  st=$(networkctl status "$1" 2>/dev/null) || return 1
+  grep -Eq 'State: [a-z-]+ \((configured|configuring)' <<< "$st"
+}
+
+# 把窗口写进 networkd 的 drop-in, 让 DHCP 下发的默认路由自带. 三个前提缺一不可:
+#   1) systemd >= 255 —— [DHCPv4] 里的 InitialCongestionWindow= 是 255 才加的,
+#      249(Ubuntu 22.04)会报 Unknown key 并忽略
+#   2) 当前默认路由是 DHCP 下发的(proto dhcp). 静态 Gateway= 要改 [Route] 段,
+#      等于改写用户自己的路由定义, 不碰
+#   3) 找得到这块网卡用的 .network 文件(netplan 生成在 /run/systemd/network)
+# 不 reload networkd: reload 会重配网卡, 生产机上不值得冒这个险. 运行时的窗口
+# 调用方已经直接设好了, drop-in 管的是 networkd 下一次(重启 / 续租 / 开机)装路由.
+write_networkd_dropin(){   # write_networkd_dropin <网卡> [窗口 token...]
+  local iface="$1"; shift
+  local ver nf dir route cw="" rw=""
+  ver=$(systemctl --version 2>/dev/null | awk 'NR==1{print $2+0}')
+  [ "${ver:-0}" -ge 255 ] 2>/dev/null || return 1
+  route=$(ip -4 route show default 2>/dev/null |
+          awk -v d="$iface" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; exit}}')
+  case " $route " in *" proto dhcp "*) ;; *) return 1 ;; esac
+  nf=$(networkctl status "$iface" 2>/dev/null) || return 1      # 同 networkd_manages: 先存再查
+  nf=$(awk -F': ' '/Network File:/{print $2; exit}' <<< "$nf")
+  case "$nf" in /*.network) ;; *) return 1 ;; esac
+  while [ $# -ge 2 ]; do
+    case "$1" in initcwnd) cw="$2" ;; initrwnd) rw="$2" ;; esac
+    shift 2
+  done
+  [ -n "$cw$rw" ] || return 1
+  dir="$NETWORKD_DIR/${nf##*/}.d"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  {
+    printf '# tcpfit: networkd 每次装 DHCP 默认路由时自带窗口. 删掉这个文件即还原.\n'
+    printf '[DHCPv4]\n'
+    if [ -n "$cw" ]; then printf 'InitialCongestionWindow=%s\n' "$cw"; fi
+    if [ -n "$rw" ]; then printf 'InitialAdvertisedReceiveWindow=%s\n' "$rw"; fi
+  } > "$dir/$INITCWND_DROPIN_NAME" || { rm -f "$dir/$INITCWND_DROPIN_NAME"; return 1; }
+  INITCWND_DROPIN_PATH="$dir/$INITCWND_DROPIN_NAME"
+}
+
+# networkd-dispatcher 钩子: 网卡变成 routable 时写回窗口. 只认调优时那块网卡,
+# 沿用现有路由的全部 token, 只换窗口字段（和单元脚本同一套写法）.
+write_dispatcher_hook(){   # write_dispatcher_hook <网卡> [窗口 token...]
+  local iface="$1" tmp; shift
+  [ -d "$(dirname "$ROUTE_HOOK")" ] || return 1
+  tmp=$(mktemp "${ROUTE_HOOK}.XXXXXX" 2>/dev/null) || return 1
+  {
+    printf '#!/bin/sh\n'
+    printf '# tcpfit: 网卡变成 routable 时写回路由窗口. 沿用现有路由的全部 token, 只换窗口字段.\n'
+    printf 'R=$(ip -4 route show default 2>/dev/null |\n'
+    printf '    awk -v d=%s \x27{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; exit}}\x27)\n' \
+           "$(printf '%q' "$iface")"
+    printf '[ -n "$R" ] || exit 0\n'
+    cat <<'IH'
+C=$(printf '%s' "$R" | awk '{o="";for(i=1;i<=NF;i++){if($i=="initcwnd"||$i=="initrwnd"){i++;continue};o=o" "$i};print o}')
+IH
+    printf '[ -n "$C" ] && ip -4 route replace $C%s 2>/dev/null\n' "$(printf ' %s' "$@")"
+    printf 'exit 0\n'
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 755 "$tmp" && mv -- "$tmp" "$ROUTE_HOOK" || { rm -f "$tmp"; return 1; }
+}
+
+# 钩子写了不等于有人执行. Ubuntu 的 networkd-dispatcher 单元带
+# ConditionPathExistsGlob=|/etc/networkd-dispatcher/*/*: 开机时一个钩子都没有就被跳过,
+# 之后一直不跑 —— 实测本机 9/27 写的钩子到 9/30 窗口被冲掉都没执行过.
+# 现在钩子有了, 把它拉起来; 管理员禁用了它就不碰, 换别的路.
+dispatcher_running(){
+  systemctl is-enabled -q networkd-dispatcher 2>/dev/null || return 1
+  systemctl start networkd-dispatcher >/dev/null 2>&1 || true
+  systemctl is-active -q networkd-dispatcher 2>/dev/null
+}
+
+# 撤掉路由窗口的开机持久化入口: dispatcher 钩子、tcpfit-initcwnd 单元和脚本、networkd drop-in.
+# PPP 钩子不在这里删 —— 它还负责重拨后重建整形, 删不删由调用方定.
+# 删过 drop-in 会置 INITCWND_DROPIN_REMOVED=1(不在这里清零: 存档恢复会连调两次), 调用方据此提醒.
+remove_initcwnd_persistence(){
+  local f rc=0
+  rm -f "$ROUTE_HOOK" "$INITCWND_SCRIPT" || rc=1
+  # `|| true` 不能省 —— 单元不存在时 disable 返回非零, 调用方开了 set -e 就会中止.
+  systemctl disable --now tcpfit-initcwnd.service >/dev/null 2>&1 || true
+  rm -f "$INITCWND_UNIT" || rc=1
+  for f in "$NETWORKD_DIR"/*.network.d/"$INITCWND_DROPIN_NAME"; do
+    [ -e "$f" ] || continue
+    rm -f "$f" || rc=1
+    INITCWND_DROPIN_REMOVED=1
+    rmdir "${f%/*}" 2>/dev/null || true     # 目录里还有用户自己的 drop-in 就留着
+  done
+  return "$rc"
+}
+
+# networkd 不会马上重读 drop-in(不 reload, 见 write_networkd_dropin). 写、改、删之后提醒一句.
+# 说"可能": 重跑 tune 写的是同一份内容时, networkd 可能早就载入过了.
+networkd_pending_note(){
+  echo "  networkd 没有重载(重载会短暂重配网卡), 下次重启或开机后才完全按新配置;"
+  echo "  在那之前网卡断开重连时, 路由上的窗口可能暂时不对."
+}
+
+# 路由窗口的开机持久化. 按可靠性挑一条, 先清掉其他路留下的入口 ——
+# 切换方式时旧入口还在的话, 开机时两边各写一遍, 谁后跑谁赢.
+#   1) PPP 网卡                          → pppd 的 ip-up 钩子(每次拨通都跑)
+#   2) networkd 管的 DHCP 网卡, systemd >= 255 → .network drop-in(networkd 重启 / 续租都不丢)
+#   3) networkd 管的其他网卡              → dispatcher 钩子, 且 dispatcher 必须真的在跑.
+#      已知缺口: networkd 重启时链路一直是 routable, 钩子不触发, 要到网卡重连或开机才补回
+#   4) 其他有 systemd 的机器              → tcpfit-initcwnd.service, 只在开机跑
+# tune 和存档恢复共用这一套 —— 两边各写一份时已经分歧过两次.
+persist_initcwnd(){   # persist_initcwnd <网卡> [窗口 token...] ; 成功时 INITCWND_VIA 写明走的哪条
+  local iface="$1"; shift
+  local -a win=("$@")
+  [ "${#win[@]}" -gt 0 ] || win=(initcwnd 32 initrwnd 32)
+  INITCWND_VIA=""
+  remove_initcwnd_persistence || true
+  if write_ppp_hook "$iface" "${win[@]}"; then
+    INITCWND_VIA="pppd 的 ip-up 钩子"; return 0
+  fi
+  if networkd_manages "$iface"; then
+    if write_networkd_dropin "$iface" "${win[@]}"; then
+      INITCWND_VIA="systemd-networkd 配置 $INITCWND_DROPIN_PATH"; return 0
+    fi
+    if write_dispatcher_hook "$iface" "${win[@]}" && dispatcher_running; then
+      INITCWND_VIA="networkd-dispatcher 钩子"; return 0
+    fi
+    rm -f "$ROUTE_HOOK"      # 没人执行的钩子别留着冒充持久化
+  fi
+  if write_initcwnd_unit "$iface" "${win[@]}"; then
+    INITCWND_VIA="tcpfit-initcwnd.service（只在开机时执行）"; return 0
+  fi
+  return 1
 }
 
 write_qdisc(){
@@ -2025,6 +2461,11 @@ apply_test_shaper(){   # apply_test_shaper <iface> <rate_mbit>
 # 现在完整记下原始根 qdisc, 结束时按原样恢复.
 QSAVE_KIND=""; QSAVE_LEAF_KIND=""; QSAVE_IFACE=""
 qdisc_save(){   # qdisc_save <iface>
+  # 守卫必须放在这里, 不能只放 CLI 入口. 早期版本只在 cmd_probe / cmd_sweep
+  # 开头调 qdisc_guard, 而【向导直接调 probe_bandwidth】绕过了它 ——
+  # 于是外部 HTB 在"确认带宽"那一步就被破坏, 用户还没走到调优.
+  # validate_peer 同理. qdisc_save 是这些路径的共同入口.
+  [ "$QDISC_GUARD_DONE" = 1 ] || qdisc_guard "$1" || return 1
   local out handle major
   QSAVE_IFACE="$1"
   out=$(tc qdisc show dev "$1" 2>/dev/null)
@@ -2090,10 +2531,30 @@ qdisc_restore(){
   # del + add 本身是幂等的, 重复调用无害, 所以不需要这个哨兵.
 }
 # 未知/自定义 qdisc 不是我们能原样重建的, 先问过用户
+# 一次运行只问一次. 向导里 probe_bandwidth / validate_peer / cmd_sweep
+# 会各自换一遍 qdisc, 每次都弹确认会把人问烦.
+QDISC_GUARD_DONE=0
+
 qdisc_guard(){   # qdisc_guard <iface>
+  QDISC_GUARD_DONE=1
   local k; k=$(qdisc_root_kind "$1")
+  # HTB 不能一概放行. qdisc_save 只记根 qdisc 的【类型】, 不记 class、filter、
+  # 子队列和参数; 恢复时只能新建一个空 HTB 根. 所以别人配的 HTB（带 class
+  # 限速、HFSC 分层、tc filter 分类）跑完探测就没了, 而且没有任何提示.
+  # 实测: 探测前 htb 1: + class 1:10 rate 50Mbit + fq 10:,
+  #       探测后只剩 htb 8005: default 0, class 为空, 50Mbps 限速失效.
+  # 判据: $QDISC_SCRIPT 存在 = 这个 HTB 是 tcpfit 自己下发的, 能原样重建.
+  if [ "$k" = htb ]; then
+    [ -x "$QDISC_SCRIPT" ] && return 0
+    warn "本机根 qdisc 是 htb, 但不是 tcpfit 下发的（找不到 $QDISC_SCRIPT）."
+    warn "测试期间它会被临时替换, 而 tcpfit 只能恢复一个【空的】htb 根 ——"
+    warn "你自己配的 class / filter / 子队列会丢失, 限速随之失效."
+    warn "建议: 先自行备份 tc 配置（tc qdisc show / tc class show / tc filter show）."
+    confirm "  仍要继续？" || return 1
+    return 0
+  fi
   case "$k" in
-    ""|mq|fq|noqueue|pfifo_fast|fq_codel|htb) return 0 ;;
+    ""|mq|fq|noqueue|pfifo_fast|fq_codel) return 0 ;;
   esac
   warn "本机根 qdisc 是 ${k}, 测试期间会被临时替换."
   warn "结束时只能恢复成 ${k} 的默认参数, 自己的调优配置会丢失."
@@ -2106,7 +2567,7 @@ qdisc_guard(){   # qdisc_guard <iface>
 # 注意：这只是"够用的估计", 真正的限速器拐点仍要靠 sweep 实测.
 probe_bandwidth(){
   local peer="$1" iface="$2" dur="${3:-10}"
-  qdisc_save "$iface"
+  qdisc_save "$iface" || { echo ""; return 1; }
   trap 'qdisc_restore; exit 130' INT TERM HUP
   # 用 fq 做 pacing 但不设上限: 既避免突发打穿限速器, 又能探到真实上限
   qdisc_set_fq "$iface" || { qdisc_restore; echo ""; return 1; }
@@ -2140,6 +2601,7 @@ cmd_probe(){
     case "$1" in --peer) peer="$2"; shift 2 ;; *) die "未知参数: $1" ;; esac
   done
   [ -n "$peer" ] || die "需要 --peer <近处的iperf3服务器>"
+  set_route_target "$peer"
   local iface; iface=$(detect_iface)
   qdisc_guard "$iface" || { info "已取消"; return 0; }
   info "探测可用带宽（4 并发 + pacing, 约 15 秒）…"
@@ -2224,19 +2686,25 @@ cmd_sweep(){
   #   cap     —— 愿意扫到多高（--cap 可调）
   #   AGG_MIN —— 单流不可信、要用 8 流复核的带宽门槛（跟 cap 无关）
   local AGG_MIN=2500
+  local assume_yes=0 agreed_gb=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --peer) peer="$2"; shift 2 ;;
+      --yes|-y) assume_yes=1; shift ;;   # 跳过流量确认, 给无人值守用
+      # 向导内部用: 用户在确认页上已经看过并同意的预估流量(GB)
+      --agreed-gb) agreed_gb="$2"; shift 2 ;;
       --port) PEER_PORT="$2"; shift 2 ;;
       -4) IP_FAMILY="-4"; shift ;;
       -6) IP_FAMILY="-6"; shift ;;
       --nominal) nominal="$2"; shift 2 ;;
-      --from) lo="$2"; shift 2 ;;
-      --to) hi="$2"; shift 2 ;;
-      --step) step="$2"; shift 2 ;;
+      # 前导零要去掉: is_posint 认为 "08" 合法, 后面的 bash 算术却按八进制
+      # 解析并报 "value too great for base", 实际跳过预期起点.
+      --from) lo=$(strip_zeros "$2"); shift 2 ;;
+      --to) hi=$(strip_zeros "$2"); shift 2 ;;
+      --step) step=$(strip_zeros "$2"); shift 2 ;;
       --dur) dur="$2"; shift 2 ;;
       --parallel) par="$2"; shift 2 ;;
-      --margin) margin="$2"; shift 2 ;;
+      --margin) margin="$2"; shift 2 ;;   # 校验在下面统一做
       --gap) GAP="$2"; shift 2 ;;
       --cap) cap="$2"; shift 2 ;;
       --no-refine) refine=0; shift ;;
@@ -2244,13 +2712,27 @@ cmd_sweep(){
       *) die "未知参数: $1" ;;
     esac
   done
-  for _v in "nominal:$nominal:1:1000000" "step:$step:1:100000" "dur:$dur:1:600" \
+  # margin 必须一起校验: 负值会让 RECOMMEND = KNEE - margin 高于实测拐点,
+  # 等于建议用户把限速设到限速器之上, 整形完全失效. 实测 --margin -100
+  # 会写出 KNEE=20 / RECOMMEND=120.
+  for _v in "margin:$margin:0:1000000" \
+            "nominal:$nominal:1:1000000" "step:$step:1:100000" "dur:$dur:1:600" \
             "par:$par:1:128" "lo:$lo:1:1000000" "hi:$hi:1:1000000" "gap:$GAP:0:60"; do
     _n=${_v%%:*}; _r=${_v#*:}; _val=${_r%%:*}; _r=${_r#*:}; _min=${_r%%:*}; _max=${_r#*:}
     [ -z "$_val" ] && continue
     is_posint "$_val" "$_min" "$_max" || die "--${_n} 必须是 ${_min}-${_max} 的整数"
   done
+  # 向导内部参数, 不能因为它让向导半路退出: 逗号小数点(mawk + 德俄等 locale)换成点,
+  # 仍认不出就当没给 —— 退回菜单 3 / CLI 的规则(预计超过确认线就问), 依然安全.
+  agreed_gb=${agreed_gb/,/.}
+  if [ -n "$agreed_gb" ] && ! [[ $agreed_gb =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    warn "忽略无法识别的 --agreed-gb: $agreed_gb"; agreed_gb=""
+  fi
   [ -n "$peer" ] || die "需要 --peer <iperf3服务器>, 选延迟低的, 测的是本机端口上限而非跨国链路"
+  set_route_target "$peer"
+  # 用户填的带宽要单独留一份: 后面 nominal 可能被实测值覆盖,
+  # 而"实测远超所填"的判断必须拿用户原话去比.
+  local stated_nominal="$nominal"
   local iface; iface=$(detect_iface)
   # 手工给了区间就完全按用户说的来, 不做不限速探测
   local user_range=""; [ -n "$lo" ] && [ -n "$hi" ] && user_range=1
@@ -2278,6 +2760,13 @@ cmd_sweep(){
 
   # 扫一段区间. 结果放进全局 LAST_OK(最后一个干净档) 与 BROKE_AT(重传跳变的那档)
   LAST_OK=""; BROKE_AT=""; SLOW_HITS=0; PEER_TOO_SLOW=0; BASE_LOSS=""; SPIKE_MIN_LOSS=""; SLOW_AT=""
+  # 扫描覆盖率. 只有"真的测过并拿到有效样本"的档才算验证过 ——
+  # 早期版本把区间上界 hi 直接当成"已扫到", 于是上界那一档下发整形失败、
+  # 或对端连续三次没结果被跳过时, 仍然输出"扫到 40 Mbit 未检测到限速器",
+  # 向导据此把用户的旧整形删掉. 覆盖不足必须报"判不出"而不是"没有".
+  SCAN_VERIFIED=0        # 拿到有效样本的档数
+  SCAN_MAX_OK=""         # 实际验证到的最高速率
+  SCAN_INCOMPLETE=0      # 有档位失败或被跳过
   # 跳变判定: 既要超过绝对阈值, 也要明显高于本底. 远程对端可能有
   # 0.1%-0.3% 的稳定底噪, 所以用 5 倍本底; 同时把相对阈值封顶在 1%,
   # 避免底噪把实测 1.35% 以上的 policer 拐点完全遮住.
@@ -2299,14 +2788,21 @@ cmd_sweep(){
     for (( _r=a; _r<=b; _r+=st )); do pts="$pts $_r"; done
     case " $pts " in *" $b "*) ;; *) pts="$pts $b" ;; esac
     for r in $pts; do
-      apply_test_shaper "$iface" "$r" || { warn "failed to apply test shaper at ${r} Mbit"; return 1; }
+      if ! apply_test_shaper "$iface" "$r"; then
+        warn "failed to apply test shaper at ${r} Mbit"
+        SCAN_INCOMPLETE=1; return 1
+      fi
       res=""
       # 进度提示交给 run_iperf 里的转圈, 这里不要再打占位符（会和转圈重叠）
       for _ in 1 2 3; do res=$(run_iperf "$peer" "$dur" "$par"); [ -n "$res" ] && break; sleep 8; done
-      if [ -z "$res" ]; then printf '  %-10s %12s %9s %8s  %s\n' "$r" "-" "-" "-" "peer busy, skipped"; continue; fi
+      if [ -z "$res" ]; then
+        printf '  %-10s %12s %9s %8s  %s\n' "$r" "-" "-" "-" "peer busy, skipped"
+        SCAN_INCOMPLETE=1; continue
+      fi
       sgp=$(echo "$res" | awk '{print $1}'); rt=$(echo "$res" | awk '{print $2}')
       gp=$(echo "$res" | awk '{print $3}'); [ -n "$gp" ] || gp="$sgp"
       lp=$(loss_pct "$rt" "$sgp" "$dur")
+      SCAN_VERIFIED=$(( SCAN_VERIFIED + 1 )); SCAN_MAX_OK="$r"
       verdict="ok"
       # 只有干净样本才能建立本底. 不限速探测刚打穿 policer 时,
       # 第一档可能带 0.4%-8% 的假丢包; 把它当基线后再要求 10 倍跳变,
@@ -2433,11 +2929,18 @@ cmd_sweep(){
     # 机器的单流压到 2.5G 以下; 如果这条单流又恰好有路径丢包, 旧逻辑会把
     # 它误认成低速 policer 并扫描几百兆区间. 只在用户标称值已达到 AGG_MIN、
     # 且单流结果确实可疑时补一次 8 流确认，不给普通低带宽扫描增加流量.
-    if [ -n "$nominal" ] && [ "$nominal" -ge "$AGG_MIN" ] 2>/dev/null && \
+    # 没填带宽(菜单 3 回车 / CLI 不带 --nominal)时不知道机器多大, 单流可疑也要复核:
+    # 早期这里直接按单流去扫, 10G 无限速机器得出"建议整形 1464", 菜单 3 回车就限上了.
+    # 多花的流量受端口速率封顶, 小机器上只是一档 8 流.
+    if { [ -z "$nominal" ] || [ "$nominal" -ge "$AGG_MIN" ] 2>/dev/null; } && \
        awk -v g="$cap_gp" -v c="$cap" -v l="$ulp" -v t="$thresh" \
          'BEGIN{exit !(g <= c && l > t)}'; then
       local ares="" ag art ar alp
-      info "Single stream is inconclusive on a ${nominal} Mbit host; checking 8-stream aggregate"
+      if [ -n "$nominal" ]; then
+        info "Single stream is inconclusive on a ${nominal} Mbit host; checking 8-stream aggregate"
+      else
+        info "Single stream is inconclusive and no bandwidth was given; checking 8-stream aggregate"
+      fi
       qdisc_set_fq "$iface" || { qdisc_restore; warn "failed to enable fq for aggregate probe"; return 2; }
       for _ in 1 2 3; do ares=$(run_iperf "$peer" "$dur" 8); [ -n "$ares" ] && break; sleep 8; done
       qdisc_restore
@@ -2452,6 +2955,44 @@ cmd_sweep(){
         else
           printf '  %-10s %12s %9s %8s  %s\n' "none (1x)" "$cap_gp" "$urt" "$ulp" "$(_c '0;31' 'loss -- possible policer')"
           printf '  %-10s %12s %9s %8s  %s\n' "none (8x)" "$ar" "$art" "$alp" "aggregate below cap"
+          # 8 流也干净 = 这个聚合速率上没有限速器在打, 单流的丢包是单条连接自己的
+          # (对端 / 路径). 不能再按单流去扫: 模型实测 8 流 9600 零丢包, 按单流 1950
+          # 扫出 1916, 等于把一台没有限速器的 10G 机器限到五分之一.
+          # 0.5.7 把上限从 2500 提到 10000 之后, 10G 机器的聚合多半低于上限, 才走得到这里.
+          if ! awk -v l="$alp" -v t="$thresh" 'BEGIN{exit !(l > t)}'; then
+            echo
+            mkdir -p "$STATE_DIR"
+            # 8 流干净, 但跑得不够高时证明不了什么(可能就是对端只给这么多):
+            #   有标称 → 不到标称 70% 判不出
+            #   没标称 → 没高过单流 1.5 倍判不出(高出很多才说明单流的丢包是单条连接自己的)
+            local _weak=""
+            if [ -n "$nominal" ]; then
+              if awk -v g="$ar" -v n="$nominal" 'BEGIN{exit !(g < n*0.7)}' 2>/dev/null; then
+                _weak="不到标称 ${nominal} 的 70%"
+              fi
+            elif awk -v g="$ar" -v s="$cap_gp" 'BEGIN{exit !(g <= s*1.5)}'; then
+              _weak="和单流 ${cap_gp} 差不多"
+            fi
+            if [ -n "$_weak" ]; then
+              warn "8 流只送达 ${ar} Mbps, ${_weak} —— 判不出有没有限速器."
+              echo "  多半是对端太慢或路径拥塞. 换个更近/更空闲的对端重测."
+              [ -n "$nominal" ] || echo "  填上套餐带宽(--nominal / 菜单里填数字)能判得更准."
+              [ -x "$QDISC_SCRIPT" ] && echo "  已有整形保持不动."
+              {
+                printf 'INCONCLUSIVE=1\nUNSHAPED=%s\n' "$ar"
+                if [ -n "$nominal" ]; then printf 'NOMINAL=%s\n' "$nominal"; fi
+              } > "$STATE_DIR/sweep.result"
+            else
+              warn "不限速 8 流送达 ${ar} Mbps, 丢包 ${alp}%, 未检测到限速器."
+              echo "  单流的丢包来自单条连接本身(对端或路径), 不是限速器."
+              # 没填带宽时只能证明 ${ar} 以内没有限速器: 对端把 8 流卡在限速器下面也是这个结果
+              [ -n "$nominal" ] || echo "  没填带宽, 只能说明 ${ar} Mbps 以内没有限速器, 更高处判不出."
+              printf 'NO_KNEE=1\nUNSHAPED=%s\n' "$ar" > "$STATE_DIR/sweep.result"
+            fi
+            trap - INT TERM HUP     # qdisc 上面已经恢复过了, 别让 Ctrl-C 处理器留到菜单里
+            traffic_report
+            return 3
+          fi
         fi
         single_printed=1
       fi
@@ -2470,6 +3011,26 @@ cmd_sweep(){
     fi
 
     if ! awk -v l="$ulp" -v t="$thresh" 'BEGIN{exit !(l > t)}'; then
+      # 干净样本只能证明"在【测到的这个速率上】没触发限速器".
+      # 连标称的 70% 都没跑到时, 它证明不了标称速率附近没有限速器 ——
+      # 早期版本一律写 NO_KNEE=1, 向导据此把用户实测得来的旧整形删掉.
+      # 事故形态: 对端拥塞 -> 95 Mbps 干净 -> 删掉 950 Mbit 的 HTB.
+      # 这里必须和"确信没有限速器"分开表达, 让向导保留已有配置.
+      if [ -n "$nominal" ] && awk -v g="$cap_gp" -v n="$nominal" \
+         'BEGIN{exit !(n > 0 && g < n*0.7)}' 2>/dev/null; then
+        printf '  %-10s %12s %9s %8s  %s\n' "none" "$cap_gp" "$urt" "$ulp" \
+          "$(_c '0;33' 'inconclusive')"
+        echo
+        warn "只送达 ${cap_gp} Mbps, 不到标称 ${nominal} 的 70% —— 判不出有没有限速器."
+        echo "  干净样本只说明这个速率上没撞限速器, 不代表 ${nominal} 附近没有."
+        echo "  多半是对端太慢或路径拥塞. 换个更近/更空闲的对端重测."
+        [ -x "$QDISC_SCRIPT" ] && echo "  已有整形保持不动."
+        mkdir -p "$STATE_DIR"
+        printf 'INCONCLUSIVE=1\nUNSHAPED=%s\nNOMINAL=%s\n' "$cap_gp" "$nominal" \
+          > "$STATE_DIR/sweep.result"
+        traffic_report
+        return 3
+      fi
       printf '  %-10s %12s %9s %8s  %s\n' "none" "$cap_gp" "$urt" "$ulp" "ok"
       echo
       warn "不限速送达 ${cap_gp} Mbps, 丢包 ${ulp}%, 未检测到限速器."
@@ -2506,15 +3067,83 @@ cmd_sweep(){
     # 目标是区间内约 10 个采样点; 大机器上这个公式给出的值和 calc_step 基本一致.
     [ -n "$step" ] || step=$(awk -v lo="$lo" -v hi="$hi" 'BEGIN{
       s = int((hi-lo)/10 + 0.5); if (s < 1) s = 1; printf "%d", s }')
+    # 向导开始前的流量预估是按【用户填的带宽】算的 —— 填 200 就告诉他约 3 GB.
+    # 可一台 10G 口的机器不限速能跑 8532, 往下扫的流量是按实测速率走的.
+    # 客户实报: 同意的是 3 GB, 实际跑掉 400 GB. 用户同意的数和实际花的数必须对得上.
+    # 无 tty 时 confirm 走默认 n, 直接中止 —— 宁可不扫, 也不能无人值守地烧几百 GB.
+    # 三种情况要停下来问:
+    #   over   —— 实测远超所填(3 倍以上): 用户同意的流量是按所填带宽估的
+    #   agreed —— 向导里用户已经看过一个预估, 实际要跑的远超它(1.5 倍以上, 且超过确认线)
+    #   big    —— 菜单 3 / 命令行: 开始前没给过任何预估, 超过确认线就问
+    # 早期只有 over: 没填带宽时没东西可比, 一声不响地扫下去; 填 3000、实测 8100
+    # (不到 3 倍)的 10G 机器也是一句不问, 扫掉约 200 GB.
+    local _pts _gb _why=""
+    _pts=$(( (hi - lo) / step + 2 + 8 ))          # 粗扫各档 + 终点 + 精修上限
+    _gb=$(awk -v p="$_pts" -v a="$lo" -v b="$hi" -v d="$dur" \
+          'BEGIN{printf "%.0f", p*(a+b)/2*d/8/1024}')
+    if [ -n "$stated_nominal" ] &&
+       awk -v g="$ug_eff" -v n="$stated_nominal" 'BEGIN{exit !(n > 0 && g > n*3)}' 2>/dev/null; then
+      _why=over
+    elif [ -n "$agreed_gb" ]; then
+      if awk -v g="$_gb" -v a="$agreed_gb" -v t="$TRAFFIC_CONFIRM_GB" \
+           'BEGIN{exit !(g > a*1.5 && g > t)}'; then
+        _why=agreed
+      fi
+    elif awk -v g="$_gb" -v t="$TRAFFIC_CONFIRM_GB" 'BEGIN{exit !(g > t)}'; then
+      _why=big
+    fi
+    if [ -n "$_why" ] && [ "$assume_yes" != 1 ]; then
+      echo
+      if [ "$_why" = over ]; then warn "不限速实测送达 ${ug_eff} Mbps,远高于写入带宽"
+      else                        warn "不限速实测送达 ${ug_eff} Mbps"; fi
+      echo "    按实测速率, 接下来的扫描可能高达约 ${_gb} GB"
+      # 不说"按所填带宽": 带宽回车时预估是按实测值算的, 用户什么都没填
+      if [ "$_why" = agreed ]; then echo "    开始前给你看的预估是约 ${agreed_gb} GB"; fi
+      if ! confirm "  按实测速率继续扫描？" n; then
+        trap - INT TERM HUP
+        restore_qdisc
+        info "已取消扫描, 没有下发任何测试整形; 已有整形保持不动"
+        have_tty || echo "    没有终端时默认取消; 无人值守请加 --yes"
+        # 取消要和「测失败」分开: 早期版本这里 return 2, 向导当成扫描失败,
+        # 接着照样满速跑验证(10G 机器又是 20 GB), 结果页也说不出原因.
+        mkdir -p "$STATE_DIR"
+        printf 'CANCELLED=1\nUNSHAPED=%s\n' "$ug_eff" > "$STATE_DIR/sweep.result"
+        traffic_report
+        return 3
+      fi
+    fi
     info "Policer present, scanning ${lo} -> ${hi} Mbit（不限速实测送达 ${ug_eff} Mbps）"
     info "Cooling down ${PRE_SCAN_GAP}s before the first scan point"
     sleep "$PRE_SCAN_GAP"
   fi
 
+  # 手工区间(--from/--to)不做不限速探测, 上面那道确认走不到. 而 OUT_OF_RANGE 时工具自己
+  # 建议的下一条命令就是 sweep --from X --to 2X —— 10G 口上一次 200 GB 也不问(复审实测).
+  # 按区间速率估(实际速率被端口封顶, 这是上限), 规则同菜单 3 / CLI: 超过确认线先问.
+  if [ -n "$user_range" ] && [ "$assume_yes" != 1 ]; then
+    local _mpts _mgb
+    _mpts=$(( (hi - lo) / step + 2 + 8 ))
+    _mgb=$(awk -v p="$_mpts" -v a="$lo" -v b="$hi" -v d="$dur" \
+           'BEGIN{printf "%.0f", p*(a+b)/2*d/8/1024}')
+    if awk -v g="$_mgb" -v t="$TRAFFIC_CONFIRM_GB" 'BEGIN{exit !(g > t)}'; then
+      echo
+      warn "手工区间 ${lo} -> ${hi} Mbit, 按这个区间估算, 扫描可能高达约 ${_mgb} GB"
+      if ! confirm "  按这个区间继续扫描？" n; then
+        trap - INT TERM HUP
+        restore_qdisc
+        info "已取消扫描, 没有下发任何测试整形; 已有整形保持不动"
+        have_tty || echo "    没有终端时默认取消; 无人值守请加 --yes"
+        mkdir -p "$STATE_DIR"; printf 'CANCELLED=1\n' > "$STATE_DIR/sweep.result"
+        traffic_report
+        return 3
+      fi
+    fi
+  fi
+
   echo
   info "Scanning ${lo} -> ${hi} Mbit, step ${step}, ${dur}s each, threshold loss > ${thresh}%"
   printf '  %-10s %12s %9s %8s  %s\n' "Rate/Mbit" "Goodput/Mbps" "Retrans" "Loss%" "Verdict"
-  scan_range "$lo" "$hi" "$step"
+  scan_range "$lo" "$hi" "$step" || SCAN_INCOMPLETE=1
 
   # 自动区间第一档就连续丢包时，起点可能已越过一个很浅的 policer 拐点；
   # 也可能只是远端路径稳定的 0.1%-0.3% 底噪。向下 25% 测控制点来区分：
@@ -2599,7 +3228,16 @@ cmd_sweep(){
     coarse_broke=$BROKE_AT                       # 先存下粗扫的上界, 下面会被 scan_range 重置
     # 下限 1 而不是 5 —— 步长本身现在按区间宽度推, 小机器上可能只有 1-2,
     # 硬性抬到 5 会让细扫比粗扫还粗.
-    fine=$(( step / 4 )); [ "$fine" -lt 1 ] && fine=1
+    # 精修步长默认取粗扫步长的 1/4 —— 前提是拐点区间只有一个步长宽(相邻两档).
+    # 「首档丢包 -> 向下退 25% 找对照」会把区间撑宽: 10G 机器上退 25% 就是
+    # 2000 Mbit, 区间变成 10 个步长, 按 1/4 步长走就是 43 档, 每档 12 秒 ×
+    # 6-7 Gbps ≈ 10 GB. 客户实报过一次跑掉 400 GB.
+    # 这里按区间实际宽度把精修压到 8 档以内. 正常情况区间 <= 一个步长,
+    # 宽/8 必然小于 步长/4, 取大值后结果不变（有回归用例钉住档位序列）.
+    local _w=$(( coarse_broke - LAST_OK ))
+    fine=$(( step / 4 ))
+    [ $(( (_w + 7) / 8 )) -gt "$fine" ] && fine=$(( (_w + 7) / 8 ))
+    [ "$fine" -lt 1 ] && fine=1
     echo
     info "Knee between ${LAST_OK} and ${coarse_broke}, refining with step ${fine}"
     printf '  %-10s %12s %9s %8s  %s\n' "Rate/Mbit" "Goodput/Mbps" "Retrans" "Loss%" "Verdict"
@@ -2624,18 +3262,37 @@ cmd_sweep(){
   # (用户一台 500M 标称的机器被设成 585, 而它实际能跑 9.3 Gbps).
   if [ -z "$BROKE_AT" ]; then
     echo
+    # 【覆盖检查必须放在最前面】. 有档位下发失败或被跳过时, "扫到上界" 这个
+    # 前提就不成立 —— 既不能说"没有限速器"(NO_KNEE), 也不能说"拐点不在这个
+    # 范围内"(OUT_OF_RANGE): 中断证明不了后者. 早期版本把 OUT_OF_RANGE 排在
+    # 前面并直接 return, 于是自动扫描里中间档 tc 失败仍输出"扫到上界 48".
+    # SCANNED_TO 不在这里用 —— 那个名字会被读成"已经扫到这里", 换成 REQUESTED_TO.
+    if [ "$SCAN_INCOMPLETE" = 1 ]; then
+      warn "扫描没跑完: 有档位下发失败或对端无结果, 实际只验证到 ${SCAN_MAX_OK:-无} Mbit."
+      echo "  这个结果判不出有没有限速器（请求的上界 ${hi} Mbit 并未验证）."
+      echo "  换个更空闲的对端重测, 或用 --from/--to 缩小范围."
+      mkdir -p "$STATE_DIR"
+      printf 'INCONCLUSIVE=1\nSCAN_VERIFIED=%s\nVERIFIED_TO=%s\nREQUESTED_TO=%s\n' \
+        "$SCAN_VERIFIED" "${SCAN_MAX_OK:-0}" "$hi" > "$STATE_DIR/sweep.result"
+      traffic_report
+      return 3
+    fi
     if [ -n "$ug" ] && awk -v l="${ulp:-0}" -v t="$thresh" 'BEGIN{exit !(l > t)}'; then
       # 不限速时明明高丢包, 说明限速器确实存在, 只是不在扫描范围内 ——
       # 这跟"没有限速器"是两回事, 不能混为一谈.
       warn "不限速时丢包 ${ulp}%, 但扫到上界 ${hi} Mbit 仍未定位到拐点."
       echo "  限速器应该存在, 只是不在本次扫描范围内. 可以扩大范围重扫:"
       echo "    $(disp) sweep --peer <对端> --from ${hi} --to $(( hi * 2 ))"
-      mkdir -p "$STATE_DIR"; printf 'OUT_OF_RANGE=1\nSCANNED_TO=%s\n' "$hi" > "$STATE_DIR/sweep.result"
+      mkdir -p "$STATE_DIR"
+      printf 'OUT_OF_RANGE=1\nSCANNED_TO=%s\nVERIFIED_TO=%s\n' \
+        "$hi" "${SCAN_MAX_OK:-0}" > "$STATE_DIR/sweep.result"
       traffic_report
       return 3
     fi
     warn "扫到 ${hi} Mbit 仍未出现丢包跳变, 未检测到限速器."
-    mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nSCANNED_TO=%s\n' "$hi" > "$STATE_DIR/sweep.result"
+    mkdir -p "$STATE_DIR"
+    printf 'NO_KNEE=1\nSCANNED_TO=%s\nVERIFIED_TO=%s\n' \
+      "$hi" "${SCAN_MAX_OK:-0}" > "$STATE_DIR/sweep.result"
     traffic_report
     return 3
   fi
@@ -2773,6 +3430,14 @@ cmd_verify(){
   verify_measure "$peer"
   verify_verdict "$shaper"
   rule
+  # 退出码要反映实测结果. 文件开头的约定是 2 = 实测失败, 而早期版本
+  # 末尾的 rule 总是成功, 于是两项测速全失败也返回 0 ——
+  # 上层脚本/监控拿退出码判断时会把彻底失败当成通过.
+  if [ -z "$VG1" ] && [ -z "$VG4" ]; then
+    warn "两项实测都没拿到结果, 无法验证（对端不可达/占线?）"
+    return 2
+  fi
+  return 0
 }
 
 # ── 检查更新 ────────────────────────────────────────────────────────────────
@@ -3017,7 +3682,7 @@ validate_peer(){
   local peer="$1" nominal="$2" iface="$3"
   # 低带宽线路不能硬抬到 20M: 15M 线路会被验证流量自己打穿.
   local rate=$(( nominal * 40 / 100 )); [ "$rate" -lt 1 ] && rate=1
-  qdisc_save "$iface"
+  qdisc_save "$iface" || { echo "skip:guard"; return 1; }
   # 早期版本这里没有任何 trap: 中断就把机器留在标称 40% 的限速上, 直到重启
   trap 'qdisc_restore; exit 130' INT TERM HUP
   apply_test_shaper "$iface" "$rate" || { qdisc_restore; echo "unreachable"; return 1; }
@@ -3052,6 +3717,9 @@ flush_input(){ :; }
 # 坑: read -t 0 只判断"有没有数据", 不消费数据, 用它是死循环; 超时必须非零.
 # 坑2: 重定向从左往右生效, </dev/tty 要写在 2>/dev/null 后面, 否则无 tty 时报错漏出来.
 drain_tty(){ while read -rsn1 -t 0.05 2>/dev/null </dev/tty; do :; done; return 0; }
+
+# 能不能打开控制终端. 重定向顺序同下面 ask 的注释: 2>/dev/null 必须在前.
+have_tty(){ : 2>/dev/null </dev/tty; }
 
 ask(){  # ask "问题" "默认值"  -> 回显用户输入或默认值
   local q="$1" d="${2:-}" a
@@ -3131,9 +3799,10 @@ banner(){
 
 # 一键全自动.
 # 设计原则：所有要用户回答的东西集中在最前面（3 个问题）, 确认之后一路跑到底不再打断；
+# 唯一的例外是流量: 实测出来的流量远超用户同意的数时, 停下来再问一次（默认否）.
 # 执行阶段的日志用英文（都是参数名和数值, 中英混排反而看不清）, 结论用中文.
 wizard(){
-  local WIZARD=1 ARCH_INCLUDE_SWEEP=0
+  local WIZARD=1 ARCH_INCLUDE_SWEEP=0 WIZARD_FAILED=0
   local ARCH_ROLE="" ARCH_BW="" ARCH_RTT="" ARCH_PEER=""
   local ram; ram=$(detect_ram_mb)
   echo
@@ -3321,6 +3990,7 @@ wizard(){
       # auto_pick_peer 已经把真实原因打在上面了, 这里只说结果.
       local picked; picked=$(auto_pick_peer) || die "没能自动选出对端, 在上一步手动填一个" 2
       peer="${picked%:*}"; PEER_PORT="${picked##*:}"
+      set_route_target "$peer"      # 出口按这个目标定, 不按主表 default
       break
     fi
     # 拆主机和端口. 不能只按"最后一个冒号"拆 —— IPv6 地址本身满是冒号:
@@ -3346,6 +4016,7 @@ wizard(){
     printf '    检查 %s:%s … ' "$peer" "$PEER_PORT" >&2
     if probe_port "$peer" "$PEER_PORT" 6; then
       printf '%s\n' "$(_c '0;32' '可达')" >&2
+      set_route_target "$peer"    # 手填这一支也要设, 不能只在自动选那支设
       break
     fi
     printf '%s\n' "$(_c '0;31' '连不上')" >&2
@@ -3390,7 +4061,12 @@ wizard(){
   echo
   if [ -n "$MANUAL_RATE" ]; then _conf "预计耗时" "约 1 分钟"
   else                              _conf "预计耗时" "约 10 分钟"; fi
-  if [ -n "$MANUAL_RATE" ]; then _conf "预计流量" "很少"
+  # 填 0 / m 时不扫描, 但验证(单流 + 4 流各约 10 秒)照样满速跑, 填 0 还要先测带宽 ——
+  # 早期一律写"很少", 10G 口实际 35 GB(复审实测).
+  if [ "$MANUAL_RATE" = off ]; then
+    _conf "预计流量" "不扫描; 测带宽和验证仍按端口速率满速跑约 30 秒"
+  elif [ -n "$MANUAL_RATE" ]; then
+    _conf "预计流量" "约 $(LC_ALL=C awk -v r="$MANUAL_RATE" 'BEGIN{printf "%.1f", r*20/8/1024}') GB（不扫描, 只验证）"
   elif [ "$bw" = auto ]; then   _conf "预计流量" "带宽实测后才能估"
   else
     _conf "预计流量" "约 $(estimate_traffic_gb "$bw") GB"
@@ -3407,15 +4083,28 @@ wizard(){
   rule
   confirm "  开始调优？" y || { info "已取消, 未做任何改动"; return 0; }
 
-  # ══ 执行阶段：全自动, 不再有任何提问 ══════════════════════════════════
+  # ══ 执行阶段：全自动, 只在流量远超预估时再问一次 ════════════════════════
   traffic_mark
   printf '\n  %s════ Running ═══════════════════════════════════════════%s\n' "$bold" "$plain"
 
   printf '\n  %s[1/5] Base tuning%s\n' "$bold" "$plain"
+  local skip_scan=0
   if [ "$bw" = auto ]; then
     info "Probing bandwidth (4 streams + pacing, ~15s)..."
     bw=$(probe_bandwidth "$peer" "$(detect_iface)") || die "bandwidth probe failed" 2
     ok "Measured ~${bw} Mbps"
+    # 确认页上只能写「带宽实测后才能估」, 用户点头的是一个未知数.
+    # 实测完必须把流量摆出来, 大的要重新确认: 10G 口一轮两三百 GB(客户实报 400 GB).
+    # 扫描里那道「实测超过所填 3 倍」的保护在这里不起作用 —— 所填就是这次实测值.
+    # 回车(默认否)就只做基础调优, 不扫也不验证.
+    if [ -z "$MANUAL_RATE" ]; then
+      local _est; _est=$(estimate_traffic_gb "$bw")
+      info "按实测带宽估算, 扫描和验证约 ${_est} GB 流量"
+      if awk -v g="$_est" -v t="$TRAFFIC_CONFIRM_GB" 'BEGIN{exit !(g > t)}' &&
+         ! confirm "  预计约 ${_est} GB, 继续扫描？" n; then
+        skip_scan=1
+      fi
+    fi
   fi
   # 小带宽 policer 上 initcwnd 32 的首轮突发会直接打穿令牌桶.
   # 三台 10-20M 真机都表现为首秒重传、后续吞吐逐秒下降;
@@ -3427,6 +4116,15 @@ wizard(){
     cmd_tune --role "$role" --bw "$bw" || die "base tuning failed"
   fi
   ARCH_PEER="$peer"
+
+  # 用户没同意那么多流量: 路径检查、扫描、验证全是满速测试, 一个都不跑.
+  if [ "$skip_scan" = 1 ]; then
+    info "按你的选择跳过了拐点扫描和验证, 只做了基础调优"
+    [ -x "$QDISC_SCRIPT" ] && info "上次的整形保留未动"
+    wizard_archive
+    wizard_result "$bw" "" "" "" "$ram" "" "" "" 1
+    return 0
+  fi
 
   # 这四个必须在所有分支之前声明. set -u 下, 只要有一条路径没赋值,
   # 结尾传给 wizard_result 时就是 unbound variable —— v0.3.8 的"未检测到限速器"
@@ -3440,8 +4138,17 @@ wizard(){
       cmd_shape --off
       rate=""
     else
-      cmd_shape --rate "$MANUAL_RATE"
-      rate="$MANUAL_RATE"
+      # 结果页必须按【实际读回值】显示. 早期版本忽略 cmd_shape 的退出码,
+      # 直接 rate="$MANUAL_RATE", 于是 tc class 下发失败时底层已经报了
+      # "shaping did not take effect", 结果页却写"已应用整形 50 Mbit",
+      # 同一轮的存档里反而正确记着 SHAPE_RATE=none —— 三处互相矛盾.
+      if cmd_shape --rate "$MANUAL_RATE"; then
+        rate="$MANUAL_RATE"
+      else
+        warn "整形没有生效, 结果页按网卡实况显示"
+        rate=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
+        WIZARD_FAILED=1
+      fi
       info "Cooling down 15s before verification"
       sleep 15
     fi
@@ -3449,6 +4156,8 @@ wizard(){
     command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
     wizard_archive
     wizard_result "$bw" "$rate" "$knee" "$margin" "$ram"
+    # 手填分支也要传播失败 —— 只在自动分支末尾加 return 是不够的
+    [ "$WIZARD_FAILED" = 0 ] || return 1
     return 0
   fi
 
@@ -3466,20 +4175,46 @@ wizard(){
 
   printf '\n  %s[3/5] Policer sweep%s\n' "$bold" "$plain"
   local sweep_rc=0
-  cmd_sweep --peer "$peer" --nominal "$bw" || sweep_rc=$?
+  # 把用户已经看过的预估带进去: 填了带宽时就是确认页上那个数, 回车实测时是测完后报的那个.
+  # 实际要扫的比它大得多(比如填 3000 而端口跑 8100)时, 扫描前还要再问一次.
+  cmd_sweep --peer "$peer" --nominal "$bw" --agreed-gb "$(estimate_traffic_gb "$bw")" || sweep_rc=$?
   # rc=3 是"扫完了但没有可用拐点"(没限速器/超上限/超范围), 结果文件是这轮写的, 可以读.
   # 其他非 0 是这轮压根没跑成, 结果文件已被清空, 不要去读.
   [ "$sweep_rc" = 0 ] || [ "$sweep_rc" = 3 ] || warn "sweep failed, shaping skipped"
 
-  local out_of_range="" above_cap=""
+  local out_of_range="" above_cap="" inconclusive="" cancelled=""
   if { [ "$sweep_rc" = 0 ] || [ "$sweep_rc" = 3 ]; } && [ -f "$STATE_DIR/sweep.result" ]; then
     ARCH_INCLUDE_SWEEP=1
+    cancelled=$(awk -F= '/^CANCELLED/{print $2}' "$STATE_DIR/sweep.result")
+    # 取消的那轮不算扫描结果, 存档里不写 SWEEP_ 字段(和以前取消时一致)
+    [ -n "$cancelled" ] && ARCH_INCLUDE_SWEEP=0
     no_knee=$(awk -F= '/^NO_KNEE/{print $2}' "$STATE_DIR/sweep.result")
+    inconclusive=$(awk -F= '/^INCONCLUSIVE/{print $2}' "$STATE_DIR/sweep.result")
     out_of_range=$(awk -F= '/^OUT_OF_RANGE/{print $2}' "$STATE_DIR/sweep.result")
     above_cap=$(awk -F= '/^ABOVE_CAP/{print $2}' "$STATE_DIR/sweep.result")
     knee=$(awk -F= '/^KNEE/{print $2}'      "$STATE_DIR/sweep.result")
     rate=$(awk -F= '/^RECOMMEND/{print $2}' "$STATE_DIR/sweep.result")
     [ -n "$knee" ] && [ -n "$rate" ] && margin=$(( knee - rate ))
+  fi
+
+  # sweep 内部用「跑不到标称 70%」判"测不准", 但 --bw auto 时 nominal 就是
+  # 这一轮探出来的慢结果, 等于拿自己跟自己比, 判据形同虚设.
+  # 这里补第二个参照: 【已有的整形值】—— 它是上一次实测的产物.
+  # 这次只测到它的 70% 以下, 不足以推翻它, 更不该据此把它删掉.
+  if [ -n "$no_knee" ] && [ -f "$STATE_DIR/sweep.result" ]; then
+    local _prev _uns
+    _prev=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
+    _uns=$(awk -F= '/^UNSHAPED/{print $2}' "$STATE_DIR/sweep.result")
+    if [ -n "$_prev" ] && [ -n "$_uns" ] &&
+       awk -v u="$_uns" -v p="$_prev" 'BEGIN{exit !(p > 0 && u < p*0.7)}' 2>/dev/null; then
+      warn "本次只测到 ${_uns} Mbps, 远低于已有整形 ${_prev} Mbit —— 判不出限速器是否真的消失."
+      no_knee=""; inconclusive=1
+      # 存档和 sweep.result 也要跟着改 —— 早期版本只改向导的局部变量,
+      # 于是屏幕上说"保留旧整形", 落盘的却仍是 NO_KNEE=1, 两处互相矛盾,
+      # 下次读这个文件的人(或菜单 3)会按"没有限速器"处理.
+      printf 'INCONCLUSIVE=1\nUNSHAPED=%s\nPREV_SHAPE=%s\n' \
+        "$_uns" "$_prev" > "$STATE_DIR/sweep.result"
+    fi
   fi
 
   printf '\n  %s[4/5] Apply shaping%s\n' "$bold" "$plain"
@@ -3488,10 +4223,18 @@ wizard(){
   # 而结果页写着"整形 未设置" —— 屏幕和实际不一致.
   # 只在 no_knee(确信没有限速器) 时移除; 扫描失败/超范围时并不知道有没有限速器,
   # 保留上次的配置更安全, 但要说清楚.
-  if [ -n "$rate" ]; then cmd_shape --rate "$rate"
+  if [ -n "$rate" ]; then
+    if ! cmd_shape --rate "$rate"; then
+      warn "整形没有生效, 结果页按网卡实况显示"
+      rate=$(tc_rate_mbit "$(tc class show dev "$(detect_iface)" 2>/dev/null)")
+      WIZARD_FAILED=1
+    fi
   elif [ -n "$out_of_range" ]; then
     info "policer present but knee not located in range, shaping skipped"
     [ -x "$QDISC_SCRIPT" ] && warn "上次的整形保留未动（本次没测准）"
+  elif [ -n "$inconclusive" ]; then
+    info "测速能力不足, 判不出有没有限速器, 不改整形"
+    [ -x "$QDISC_SCRIPT" ] && warn "上次的整形保留未动（本次没测准, 换个对端再来）"
   elif [ -n "$above_cap" ]; then
     info "unshaped throughput exceeds the sweep cap, shaping skipped"
     if [ -x "$QDISC_SCRIPT" ]; then
@@ -3507,6 +4250,9 @@ wizard(){
       info "未发现限速器, 当前网卡立即切换为纯 fq"
     fi
     cmd_shape --off
+  elif [ -n "$cancelled" ]; then
+    info "按你的选择跳过了拐点扫描, 不改整形"
+    [ -x "$QDISC_SCRIPT" ] && info "上次的整形保留未动"
   else
     warn "no knee measured, shaping skipped"
     [ -x "$QDISC_SCRIPT" ] && warn "上次的整形保留未动（本次没测出结果）"
@@ -3516,14 +4262,20 @@ wizard(){
   # 扫描的丢包档会耗尽服务商 policer 的令牌. 立即验证时第一条流会
   # 带着 1%-3% 的残余重传, 而几秒后的第二条流是 0. 和扫描前一样等待
   # 15s, 让验证测的是最终整形效果, 不是上一档的残留状态.
-  if [ -n "$rate" ] || [ -n "$out_of_range" ] || [ -n "$above_cap" ]; then
-    info "Cooling down 15s before verification"
-    sleep 15
+  if [ -n "$cancelled" ]; then
+    # 验证同样是满速单流 + 4 流, 10G 机器上又是 20 GB —— 用户刚拒绝过这种流量
+    info "验证同样要满速跑, 一并跳过"
+  else
+    if [ -n "$rate" ] || [ -n "$out_of_range" ] || [ -n "$above_cap" ]; then
+      info "Cooling down 15s before verification"
+      sleep 15
+    fi
+    command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
   fi
-  command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
 
   wizard_archive
-  wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "$no_knee" "$out_of_range" "$above_cap"
+  wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "$no_knee" "$out_of_range" "$above_cap" "$cancelled"
+  [ "$WIZARD_FAILED" = 0 ] || return 1
 }
 
 # 两条向导路径都在最终整形和验证后保存; archive_write 从机器读取实际状态.
@@ -3534,8 +4286,9 @@ wizard_archive(){
 }
 
 # 结果段落. 正常流程和"手动指定整形值"两条路径共用, 避免两份重复的排版代码.
-wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内存MB> [无拐点] [超范围] [超上限]
+wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内存MB> [无拐点] [超范围] [超上限] [跳过扫描]
   local bw="${1:-}" rate="${2:-}" knee="${3:-}" margin="${4:-}" ram="${5:-0}" no_knee="${6:-}" oor="${7:-}" cap="${8:-}"
+  local skipped="${9:-}"
   local cur_shape=""
   printf '\n  %s════ 结果 ══════════════════════════════════════════════%s\n' "$bold" "$plain"
   echo
@@ -3561,12 +4314,20 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
       _conf "原因" "不限速吞吐超过 ${cap} Mbit 扫描上限"
       _conf ""     "未判断是否有限速器, 不自动改整形"
     elif [ -n "$no_knee" ]; then _conf "原因" "扫描未发现限速器, 加整形只会限制自己"
+    elif [ -n "$skipped" ]; then _conf "原因" "流量太大, 按你的选择跳过了拐点扫描"
     fi
     echo
   fi
   # verify 的判定也要按实况: 本次没应用但网卡上还有旧整形时, 目标值取那个,
   # 否则会给一台正被限速的机器说"这台没有应用整形".
-  verify_verdict "${rate:-$cur_shape}"
+  # 跳过扫描时验证也没跑, 照常打表格会显示两行"测试失败".
+  if [ -n "$skipped" ]; then
+    echo "  验证"
+    echo "      已跳过（和扫描一样要满速跑）"
+    echo
+  else
+    verify_verdict "${rate:-$cur_shape}"
+  fi
   traffic_report
   echo
   echo "  本次改动和快照位置"
@@ -3594,7 +4355,13 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
     done
   fi
   echo
-  ok "调优完成."
+  # 整形下发失败时不能说"完成"、也不能返回 0 —— 上层脚本和监控看退出码.
+  # 数值已经按实况显示了(D04), 但状态传播是另一件事.
+  if [ "${WIZARD_FAILED:-0}" = 1 ]; then
+    warn "调优未完全成功: 整形没有生效, 上面的结果页已按网卡实况显示."
+  else
+    ok "调优完成."
+  fi
   echo
   echo "  ─────────────────────────────────────────────"
   echo "    菲比VPS补货频道：        t.me/vpskuaibu"
@@ -3606,6 +4373,23 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
 
 menu_loop(){
   need_root
+  # 菜单和一键调优全靠问答. 没有终端时 ask 只能拿默认值, 等于每一问都按默认同意:
+  # 实测 `ssh host tcpfit`(没带 -t) / cron / 面板「执行命令」会自动选 1、实测带宽、
+  # 选公共节点、「开始调优」, 一路跑完扫描和整形 —— 10G 机器上是两三百 GB.
+  # 没装上 iperf3 时还会在「请手动填一个数字」那里死循环刷屏(25 秒 1.5 万行).
+  # 放在 self_install / telemetry 之前: 什么都没做的一次不该装文件、也不该计数.
+  if ! have_tty; then
+    warn "没有可交互的终端. 菜单和一键调优要回答问题, 不能无人值守运行."
+    # 还没装过(第一次用 bash <(curl …) 跑)时, /usr/local/bin/tcpfit 不存在, 不能拿它举例
+    if [ -x "$SELF_PATH" ]; then
+      echo "  远程执行请加 -t:   ssh -t <主机> tcpfit"
+      echo "  脚本里请用子命令:  tcpfit tune --bw 500   （tcpfit help 看全部）"
+    else
+      echo "  远程执行请加 -t:   ssh -t <主机> 'bash <(curl -fsSL $SELF_URL)'"
+      echo "  脚本里请用子命令:  bash <(curl -fsSL $SELF_URL) tune --bw 500"
+    fi
+    exit 1
+  fi
   take_lock
   migrate_legacy
   self_install
